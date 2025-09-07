@@ -1,0 +1,849 @@
+--------------------------------------
+User:
+
+
+This method is part of a NET Framework 4.7+ class that uses WPF for image manipulation. Does it have any problems or mistakes?
+
+    static BitmapSource AdjustSaturation(BitmapSource src, int saturation) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        src.CopyPixels(pixels, stride, 0);
+
+        double satFactor = saturation / 100.0;
+        for (int i = 0; i < pixels.Length; i += 4) {
+            double b = pixels[i] / 255.0;
+            double g = pixels[i + 1] / 255.0;
+            double r = pixels[i + 2] / 255.0;
+
+            double gray = 0.3 * r + 0.59 * g + 0.11 * b;
+            r = gray + (r - gray) * satFactor;
+            g = gray + (g - gray) * satFactor;
+            b = gray + (b - gray) * satFactor;
+
+            pixels[i] = (byte)Math.Min(255, Math.Max(0, b * 255));
+            pixels[i + 1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+            pixels[i + 2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+        }
+
+        var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+--------------------------------------
+ChatGPT:
+
+
+I’ve reviewed your method carefully — it’s mostly correct, but there are a few issues and caveats worth pointing out:
+
+✅ Things that work fine
+
+Pixel access: Correctly assumes 4 bytes per pixel (Pbgra32 = premultiplied BGRA).
+
+Grayscale conversion: Uses common NTSC coefficients (0.3, 0.59, 0.11).
+
+Saturation adjustment: Formula is correct (gray + (c-gray)*satFactor).
+
+Clamping: Correctly clamps to [0,255].
+
+WriteableBitmap creation: Properly sets stride, DPI, format, freezes the result.
+
+⚠️ Potential problems
+
+Ignores alpha (premultiplied!)
+
+Pbgra32 means each color channel is already multiplied by alpha.
+
+By treating channels as if they are straight RGB, you’ll distort semi-transparent pixels (they can become brighter than intended).
+
+If your images contain transparency, you should first unpremultiply, process, then premultiply again.
+
+csharp
+Copy code
+byte a = pixels[i + 3];
+if (a > 0) {
+    double alpha = a / 255.0;
+    r /= alpha;
+    g /= alpha;
+    b /= alpha;
+    // process saturation here
+    r *= alpha;
+    g *= alpha;
+    b *= alpha;
+}
+
+
+int saturation scaling
+
+You assume saturation is a percentage (100 = normal).
+
+Values below 100 reduce saturation, values above 100 boost it.
+
+But negative values are not handled explicitly — they’ll invert the formula:
+
+0 → grayscale
+
+100 → unchanged
+
+200 → double saturation
+
+< 0 → produces weird effects (can flip colors).
+
+You may want to clamp or define acceptable ranges, e.g.:
+
+csharp
+Copy code
+satFactor = Math.Max(0, saturation) / 100.0;
+
+
+Or allow negatives intentionally if you want a "color inversion" effect.
+
+Performance
+
+The loop is fine for small images, but for large images it will be slow in pure C#.
+
+You could improve speed with unsafe and pointers (avoiding array bounds checks), or use Parallel.For.
+
+Color accuracy
+
+The grayscale coefficients (0.3, 0.59, 0.11) are a simplified version.
+
+A more perceptually accurate set is Rec.709 (0.2126, 0.7152, 0.0722).
+
+Not "wrong", but depends on how accurate you want to be.
+
+🛠 Recommended fixes
+
+Handle premultiplied alpha correctly (otherwise semi-transparent pixels will be wrong).
+
+Decide on saturation range (e.g. 0–200).
+
+Consider using Rec.709 weights for grayscale.
+
+Optimize if you plan to run this on big images frequently.
+
+👉 Do you want me to rewrite this method with premultiplied alpha handling and performance optimizations (still safe, no unsafe code), or keep it simple and just fix alpha handling?
+--------------------------------------
+User:
+
+
+apply all suggestions
+--------------------------------------
+ChatGPT:
+
+
+Got it 👍 — here’s your method rewritten with all the improvements:
+
+Handles premultiplied alpha correctly (unpremultiply → adjust saturation → premultiply again).
+
+Clamps saturation factor to non-negative values (0 = grayscale, 100 = original, 200 = double saturation).
+
+Uses Rec.709 weights (0.2126, 0.7152, 0.0722) for better perceptual accuracy.
+
+Optimized loop with Parallel.For to speed up large images.
+
+csharp
+Copy code
+using System;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+static BitmapSource AdjustSaturation(BitmapSource src, int saturation)
+{
+    var format = PixelFormats.Pbgra32;
+    int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+    byte[] pixels = new byte[stride * src.PixelHeight];
+    src.CopyPixels(pixels, stride, 0);
+
+    // Clamp saturation to >= 0
+    double satFactor = Math.Max(0, saturation) / 100.0;
+
+    // Rec.709 luma coefficients
+    const double cr = 0.2126;
+    const double cg = 0.7152;
+    const double cb = 0.0722;
+
+    Parallel.For(0, src.PixelHeight, y =>
+    {
+        int offset = y * stride;
+        for (int x = 0; x < src.PixelWidth; x++, offset += 4)
+        {
+            double b = pixels[offset] / 255.0;
+            double g = pixels[offset + 1] / 255.0;
+            double r = pixels[offset + 2] / 255.0;
+            byte a = pixels[offset + 3];
+
+            if (a > 0)
+            {
+                double alpha = a / 255.0;
+
+                // Unpremultiply
+                r /= alpha;
+                g /= alpha;
+                b /= alpha;
+
+                // Convert to grayscale using Rec.709
+                double gray = cr * r + cg * g + cb * b;
+
+                // Apply saturation
+                r = gray + (r - gray) * satFactor;
+                g = gray + (g - gray) * satFactor;
+                b = gray + (b - gray) * satFactor;
+
+                // Repremultiply
+                r *= alpha;
+                g *= alpha;
+                b *= alpha;
+            }
+
+            // Clamp and store back
+            pixels[offset]     = (byte)Math.Min(255, Math.Max(0, b * 255));
+            pixels[offset + 1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+            pixels[offset + 2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+            // alpha unchanged
+        }
+    });
+
+    var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+    wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+    wb.Freeze();
+    return wb;
+}
+
+✔️ Behavior after fixes
+
+saturation = 0 → grayscale.
+
+saturation = 100 → unchanged.
+
+saturation > 100 → more vivid colors.
+
+Transparent pixels are handled correctly (no halos or brightening).
+
+Should run much faster on large images because of Parallel.For.
+
+Do you want me to also make it unsafe pointer-based (faster still, no array bound checks), or keep it purely safe managed code as above?
+--------------------------------------
+User:
+
+
+yes
+--------------------------------------
+ChatGPT:
+
+
+Perfect 👍 — here’s the unsafe pointer-based version of your method.
+
+This is faster than the array approach because it removes bounds checks, while still keeping all the correctness improvements we discussed:
+
+csharp
+Copy code
+using System;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+static BitmapSource AdjustSaturation(BitmapSource src, int saturation)
+{
+    var format = PixelFormats.Pbgra32;
+    int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+    byte[] pixels = new byte[stride * src.PixelHeight];
+    src.CopyPixels(pixels, stride, 0);
+
+    double satFactor = Math.Max(0, saturation) / 100.0;
+
+    // Rec.709 luma coefficients
+    const double cr = 0.2126;
+    const double cg = 0.7152;
+    const double cb = 0.0722;
+
+    unsafe
+    {
+        fixed (byte* ptr = pixels)
+        {
+            Parallel.For(0, src.PixelHeight, y =>
+            {
+                byte* row = ptr + y * stride;
+
+                for (int x = 0; x < src.PixelWidth; x++, row += 4)
+                {
+                    double b = row[0] / 255.0;
+                    double g = row[1] / 255.0;
+                    double r = row[2] / 255.0;
+                    byte a = row[3];
+
+                    if (a > 0)
+                    {
+                        double alpha = a / 255.0;
+
+                        // Unpremultiply
+                        r /= alpha;
+                        g /= alpha;
+                        b /= alpha;
+
+                        // Convert to grayscale (Rec.709)
+                        double gray = cr * r + cg * g + cb * b;
+
+                        // Apply saturation
+                        r = gray + (r - gray) * satFactor;
+                        g = gray + (g - gray) * satFactor;
+                        b = gray + (b - gray) * satFactor;
+
+                        // Premultiply
+                        r *= alpha;
+                        g *= alpha;
+                        b *= alpha;
+                    }
+
+                    // Clamp + store back
+                    row[0] = (byte)Math.Min(255, Math.Max(0, b * 255));
+                    row[1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+                    row[2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+                    // alpha unchanged
+                }
+            });
+        }
+    }
+
+    var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+    wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+    wb.Freeze();
+    return wb;
+}
+
+🔑 Notes
+
+Requires the /unsafe compiler option in your project settings.
+
+Much faster for big images (no array indexing overhead).
+
+Still thread-safe because each thread works on its own scanline.
+
+Same behavior as before:
+
+0 = grayscale
+
+100 = unchanged
+
+200 = double saturation
+
+Do you also want me to add an optional CancellationToken to the Parallel.For, so long-running operations can be aborted gracefully?
+--------------------------------------
+User:
+
+
+error CS1764: Cannot use fixed local 'ptr' inside an anonymous method, lambda expression, or query expression
+--------------------------------------
+ChatGPT:
+
+
+Good catch 👍 — that error happens because C# forbids capturing a fixed pointer inside a lambda (Parallel.For body).
+
+We can fix this by restructuring:
+
+Pin the array outside,
+
+Get the base pointer once,
+
+Then pass it into Parallel.For via a local copy that’s not directly “captured” by the lambda.
+
+Here’s the corrected version:
+
+csharp
+Copy code
+using System;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+static BitmapSource AdjustSaturation(BitmapSource src, int saturation)
+{
+    var format = PixelFormats.Pbgra32;
+    int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+    byte[] pixels = new byte[stride * src.PixelHeight];
+    src.CopyPixels(pixels, stride, 0);
+
+    double satFactor = Math.Max(0, saturation) / 100.0;
+
+    // Rec.709 luma coefficients
+    const double cr = 0.2126;
+    const double cg = 0.7152;
+    const double cb = 0.0722;
+
+    unsafe
+    {
+        fixed (byte* basePtr = pixels)
+        {
+            byte* p = basePtr; // make a local copy so lambda doesn't capture 'fixed'
+
+            Parallel.For(0, src.PixelHeight, y =>
+            {
+                byte* row = p + y * stride;
+
+                for (int x = 0; x < src.PixelWidth; x++, row += 4)
+                {
+                    double b = row[0] / 255.0;
+                    double g = row[1] / 255.0;
+                    double r = row[2] / 255.0;
+                    byte a = row[3];
+
+                    if (a > 0)
+                    {
+                        double alpha = a / 255.0;
+
+                        // Unpremultiply
+                        r /= alpha;
+                        g /= alpha;
+                        b /= alpha;
+
+                        // Grayscale (Rec.709)
+                        double gray = cr * r + cg * g + cb * b;
+
+                        // Apply saturation
+                        r = gray + (r - gray) * satFactor;
+                        g = gray + (g - gray) * satFactor;
+                        b = gray + (b - gray) * satFactor;
+
+                        // Repremultiply
+                        r *= alpha;
+                        g *= alpha;
+                        b *= alpha;
+                    }
+
+                    // Clamp + store
+                    row[0] = (byte)Math.Min(255, Math.Max(0, b * 255));
+                    row[1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+                    row[2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+                    // alpha unchanged
+                }
+            });
+        }
+    }
+
+    var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+    wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+    wb.Freeze();
+    return wb;
+}
+
+
+This compiles because p is a regular pointer, not a fixed one being directly captured.
+The fixed block only ensures the array stays pinned while we run Parallel.For.
+
+👉 Do you want me to also add an unsafe fallback (sequential loop) in case the runtime doesn’t allow parallel pointer access (e.g., if you want to run in a restricted environment)?
+--------------------------------------
+User:
+
+
+since you are using unsafe pointer handling, is using Parallel.For() beneficial ?
+--------------------------------------
+ChatGPT:
+
+
+Excellent question 👌
+
+Once you’ve switched to unsafe pointers, you’ve already removed the biggest bottleneck (array bounds checks). The remaining cost is pure math + memory bandwidth.
+
+Let’s break it down:
+
+🔹 When Parallel.For helps
+
+Large images (e.g. > 2000×2000).
+
+Each pixel needs ~20–30 FLOPs (normalize, grayscale, saturation, clamp).
+
+Spreading this across multiple CPU cores can reduce processing time significantly.
+
+Multi-core systems (basically all modern CPUs).
+
+WPF apps often run on quad-core+ CPUs, so parallel loops scale well.
+
+🔹 When Parallel.For doesn’t help (or hurts)
+
+Small images (e.g. icons, thumbnails).
+
+Thread scheduling overhead > computation time.
+
+Memory-bandwidth limited operations.
+
+You’re streaming pixels linearly through RAM. If your CPU cores are already saturating memory bandwidth, more threads won’t make it faster.
+
+High contention environment (UI thread busy, other background tasks).
+
+Parallelism can starve other tasks if misused.
+
+🔹 Practical performance rule of thumb
+
+Unsafe sequential pointer loop is already very fast.
+
+Parallel.For gives ~2× to 4× speedup on large images (>4–8 megapixels).
+
+On small images, it’s often slower because of overhead.
+
+🔹 Best compromise
+
+You can make it adaptive:
+
+csharp
+Copy code
+int pixelCount = src.PixelWidth * src.PixelHeight;
+bool useParallel = pixelCount > 1_000_000; // ~1MP threshold
+
+if (useParallel) {
+    Parallel.For(...);
+} else {
+    // single-threaded loop with same pointer logic
+}
+
+
+✅ So:
+
+For big photos / batch processing → keep Parallel.For.
+
+For icons / UI thumbnails → stick to single-threaded.
+
+Do you want me to modify the method so it automatically switches between sequential and parallel depending on image size?
+--------------------------------------
+User:
+
+
+rewrite it using unsafe pointers and no Parallel.For
+--------------------------------------
+ChatGPT:
+
+
+Got it 👍 — here’s the pure unsafe pointer version with no Parallel.For.
+This will run single-threaded but still very fast thanks to direct memory access and no array bound checks.
+
+csharp
+Copy code
+using System;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+static BitmapSource AdjustSaturation(BitmapSource src, int saturation)
+{
+    var format = PixelFormats.Pbgra32;
+    int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+    byte[] pixels = new byte[stride * src.PixelHeight];
+    src.CopyPixels(pixels, stride, 0);
+
+    double satFactor = Math.Max(0, saturation) / 100.0;
+
+    // Rec.709 luma coefficients
+    const double cr = 0.2126;
+    const double cg = 0.7152;
+    const double cb = 0.0722;
+
+    unsafe
+    {
+        fixed (byte* basePtr = pixels)
+        {
+            byte* row = basePtr;
+
+            for (int y = 0; y < src.PixelHeight; y++)
+            {
+                byte* pixel = row;
+
+                for (int x = 0; x < src.PixelWidth; x++, pixel += 4)
+                {
+                    double b = pixel[0] / 255.0;
+                    double g = pixel[1] / 255.0;
+                    double r = pixel[2] / 255.0;
+                    byte a = pixel[3];
+
+                    if (a > 0)
+                    {
+                        double alpha = a / 255.0;
+
+                        // Unpremultiply
+                        r /= alpha;
+                        g /= alpha;
+                        b /= alpha;
+
+                        // Convert to grayscale (Rec.709)
+                        double gray = cr * r + cg * g + cb * b;
+
+                        // Apply saturation
+                        r = gray + (r - gray) * satFactor;
+                        g = gray + (g - gray) * satFactor;
+                        b = gray + (b - gray) * satFactor;
+
+                        // Premultiply
+                        r *= alpha;
+                        g *= alpha;
+                        b *= alpha;
+                    }
+
+                    // Clamp and store back
+                    pixel[0] = (byte)Math.Min(255, Math.Max(0, b * 255));
+                    pixel[1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+                    pixel[2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+                    // alpha unchanged
+                }
+
+                row += stride;
+            }
+        }
+    }
+
+    var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+    wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+    wb.Freeze();
+    return wb;
+}
+
+✅ Benefits of this version
+
+No multithreading overhead → consistent performance across all image sizes.
+
+Very fast (unsafe pointer math).
+
+Transparent pixels handled correctly (premultiplied alpha).
+
+Rec.709 grayscale for better perceptual accuracy.
+
+saturation = 0 → grayscale, 100 → unchanged, 200 → double saturation.
+
+Do you also want me to make a sister method for adjusting brightness/contrast in the same unsafe-pointer style, so you can reuse the same pattern for other adjustments?
+--------------------------------------
+User:
+
+
+yes
+--------------------------------------
+ChatGPT:
+
+
+Perfect 👍 — here’s a brightness/contrast adjustment method written in the same style as your saturation method (unsafe pointers, premultiplied alpha handling, Rec.709 coefficients).
+
+📌 Brightness/Contrast Adjuster
+csharp
+Copy code
+using System;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+static BitmapSource AdjustBrightnessContrast(BitmapSource src, int brightness, int contrast)
+{
+    var format = PixelFormats.Pbgra32;
+    int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+    byte[] pixels = new byte[stride * src.PixelHeight];
+    src.CopyPixels(pixels, stride, 0);
+
+    // Brightness: -100..100 → factor of -1.0..+1.0
+    double brightFactor = brightness / 100.0;
+
+    // Contrast: -100..100 → factor of 0..2.0
+    double contrastFactor = (100.0 + contrast) / 100.0;
+    contrastFactor *= contrastFactor; // better curve
+
+    unsafe
+    {
+        fixed (byte* basePtr = pixels)
+        {
+            byte* row = basePtr;
+
+            for (int y = 0; y < src.PixelHeight; y++)
+            {
+                byte* pixel = row;
+
+                for (int x = 0; x < src.PixelWidth; x++, pixel += 4)
+                {
+                    double b = pixel[0] / 255.0;
+                    double g = pixel[1] / 255.0;
+                    double r = pixel[2] / 255.0;
+                    byte a = pixel[3];
+
+                    if (a > 0)
+                    {
+                        double alpha = a / 255.0;
+
+                        // Unpremultiply
+                        r /= alpha;
+                        g /= alpha;
+                        b /= alpha;
+
+                        // Apply brightness and contrast
+                        r = (((r - 0.5) * contrastFactor) + 0.5) + brightFactor;
+                        g = (((g - 0.5) * contrastFactor) + 0.5) + brightFactor;
+                        b = (((b - 0.5) * contrastFactor) + 0.5) + brightFactor;
+
+                        // Premultiply
+                        r *= alpha;
+                        g *= alpha;
+                        b *= alpha;
+                    }
+
+                    // Clamp
+                    pixel[0] = (byte)Math.Min(255, Math.Max(0, b * 255));
+                    pixel[1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+                    pixel[2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+                    // alpha unchanged
+                }
+
+                row += stride;
+            }
+        }
+    }
+
+    var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+    wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+    wb.Freeze();
+    return wb;
+}
+
+✔️ Parameter behavior
+
+Brightness:
+
+0 = unchanged
+
+-100 = fully dark
+
++100 = fully bright
+
+Contrast:
+
+0 = unchanged
+
+-100 = flat gray image
+
++100 = very high contrast
+
+👉 Do you want me to also combine saturation, brightness, and contrast into one single method (so you can apply all in one pass instead of looping pixels multiple times)?
+--------------------------------------
+User:
+
+
+sure
+--------------------------------------
+ChatGPT:
+
+
+Great 👍 — here’s a combined method that adjusts saturation, brightness, and contrast in one pass using unsafe pointers with premultiplied alpha handling.
+
+This avoids looping pixels multiple times, so it’s faster when applying multiple effects.
+
+📌 Combined Adjustments
+csharp
+Copy code
+using System;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+static BitmapSource AdjustImage(BitmapSource src, int saturation, int brightness, int contrast)
+{
+    var format = PixelFormats.Pbgra32;
+    int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+    byte[] pixels = new byte[stride * src.PixelHeight];
+    src.CopyPixels(pixels, stride, 0);
+
+    // Parameters
+    double satFactor = Math.Max(0, saturation) / 100.0; // 0 = grayscale, 100 = normal, >100 = boost
+    double brightFactor = brightness / 100.0;           // -100..100 → -1..+1
+    double contrastFactor = (100.0 + contrast) / 100.0; // -100..100 → 0..2
+    contrastFactor *= contrastFactor;                   // nonlinear scaling for better results
+
+    // Rec.709 luma coefficients
+    const double cr = 0.2126;
+    const double cg = 0.7152;
+    const double cb = 0.0722;
+
+    unsafe
+    {
+        fixed (byte* basePtr = pixels)
+        {
+            byte* row = basePtr;
+
+            for (int y = 0; y < src.PixelHeight; y++)
+            {
+                byte* pixel = row;
+
+                for (int x = 0; x < src.PixelWidth; x++, pixel += 4)
+                {
+                    double b = pixel[0] / 255.0;
+                    double g = pixel[1] / 255.0;
+                    double r = pixel[2] / 255.0;
+                    byte a = pixel[3];
+
+                    if (a > 0)
+                    {
+                        double alpha = a / 255.0;
+
+                        // Unpremultiply
+                        r /= alpha;
+                        g /= alpha;
+                        b /= alpha;
+
+                        // --- Saturation ---
+                        double gray = cr * r + cg * g + cb * b;
+                        r = gray + (r - gray) * satFactor;
+                        g = gray + (g - gray) * satFactor;
+                        b = gray + (b - gray) * satFactor;
+
+                        // --- Contrast & Brightness ---
+                        r = (((r - 0.5) * contrastFactor) + 0.5) + brightFactor;
+                        g = (((g - 0.5) * contrastFactor) + 0.5) + brightFactor;
+                        b = (((b - 0.5) * contrastFactor) + 0.5) + brightFactor;
+
+                        // Premultiply
+                        r *= alpha;
+                        g *= alpha;
+                        b *= alpha;
+                    }
+
+                    // Clamp and store
+                    pixel[0] = (byte)Math.Min(255, Math.Max(0, b * 255));
+                    pixel[1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+                    pixel[2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+                    // alpha unchanged
+                }
+
+                row += stride;
+            }
+        }
+    }
+
+    var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+    wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+    wb.Freeze();
+    return wb;
+}
+
+✔️ Behavior
+
+Saturation
+
+0 → grayscale
+
+100 → unchanged
+
+200 → double saturation
+
+Brightness
+
+0 → unchanged
+
+-100 → fully dark
+
++100 → fully bright
+
+Contrast
+
+0 → unchanged
+
+-100 → flat gray
+
++100 → strong contrast
+
+Do you also want me to add a mirror/flip option (horizontal/vertical) into this same method, so all common adjustments can be applied in one pass?
+--------------------------------------

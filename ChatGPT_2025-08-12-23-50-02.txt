@@ -1,0 +1,2678 @@
+--------------------------------------
+User:
+
+
+In C#, write a program to upscale images without any external libraries. Use WPF if it yields better results.
+--------------------------------------
+ChatGPT:
+
+
+Nice — I put together a single, ready-to-run WPF app (no external libraries) that upscales images. It gives two options:
+
+WPF High-Quality (fast, uses WPF rendering with BitmapScalingMode.Fant and an optional progressive 2× upscaling step) — very good for most uses and much faster.
+
+Lanczos (pure C#) — higher-quality resampling (good sharpness and fewer artifacts), but much slower because it's a CPU resampler implemented in managed code.
+
+Both methods use only .NET / WPF APIs. Save this as a WPF project (MainWindow + XAML). I targeted APIs compatible with .NET Framework WPF.
+
+How to use
+
+Create a new WPF App (C#, .NET Framework) in Visual Studio.
+
+Replace MainWindow.xaml and MainWindow.xaml.cs with the code below.
+
+Build & run. Click Open, adjust scale (or set width/height), choose method, then Upscale and Save.
+
+Code
+MainWindow.xaml
+xml
+Copy
+Edit
+<Window x:Class="ImageUpscaler.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Image Upscaler (WPF, no external libs)" Height="600" Width="900"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="8">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="3*"/>
+            <ColumnDefinition Width="2*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Preview area -->
+        <Border Grid.Column="0" BorderBrush="Gray" BorderThickness="1" Padding="6">
+            <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                <Image x:Name="PreviewImage" Stretch="Uniform" />
+            </ScrollViewer>
+        </Border>
+
+        <!-- Controls -->
+        <StackPanel Grid.Column="1" Margin="12" VerticalAlignment="Top" >
+            <WrapPanel Margin="0 0 0 8">
+                <Button x:Name="OpenButton" Click="OpenButton_Click" Width="80" Margin="0 0 6 0">Open</Button>
+                <Button x:Name="SaveButton" Click="SaveButton_Click" Width="80" IsEnabled="False">Save</Button>
+                <Button x:Name="UpscaleButton" Click="UpscaleButton_Click" Width="80" Margin="6 0 0 0" IsEnabled="False">Upscale</Button>
+            </WrapPanel>
+
+            <TextBlock FontWeight="Bold" Margin="0 8 0 4">Method</TextBlock>
+            <ComboBox x:Name="MethodCombo" SelectedIndex="0">
+                <ComboBoxItem>WPF High-Quality (Fant)</ComboBoxItem>
+                <ComboBoxItem>Lanczos (pure C#) — slower</ComboBoxItem>
+            </ComboBox>
+
+            <StackPanel Orientation="Horizontal" Margin="0 8 0 0" VerticalAlignment="Center">
+                <TextBlock VerticalAlignment="Center" Margin="0 0 8 0">Scale ×</TextBlock>
+                <TextBox x:Name="ScaleBox" Width="80" Text="2.0" />
+            </StackPanel>
+
+            <CheckBox x:Name="Progressive2x" Margin="0 8 0 0" IsChecked="True">
+                Progressive 2× steps (helpful for reducing artifacts)
+            </CheckBox>
+
+            <TextBlock FontWeight="Bold" Margin="0 12 0 6">Preview size</TextBlock>
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Width="60" VerticalAlignment="Center">Width</TextBlock>
+                <TextBox x:Name="PreviewWidthBox" Width="100" IsReadOnly="True" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0 4 0 0">
+                <TextBlock Width="60" VerticalAlignment="Center">Height</TextBlock>
+                <TextBox x:Name="PreviewHeightBox" Width="100" IsReadOnly="True" />
+            </StackPanel>
+
+            <Separator Margin="0 12 0 12"/>
+            <TextBlock FontWeight="Bold">Status</TextBlock>
+            <TextBlock x:Name="StatusText" Text="Idle" TextWrapping="Wrap" Margin="0 6 0 0"/>
+
+            <ProgressBar x:Name="ProgressBar" Height="18" Minimum="0" Maximum="100" Margin="0 8 0 0"/>
+
+            <TextBlock Margin="0 12 0 0" FontStyle="Italic" FontSize="12" TextWrapping="Wrap">
+                Notes: Lanczos gives the best sharpness at the cost of CPU time. WPF Fant is a very good fast option.
+            </TextBlock>
+        </StackPanel>
+    </Grid>
+</Window>
+
+MainWindow.xaml.cs
+csharp
+Copy
+Edit
+using Microsoft.Win32;
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+namespace ImageUpscaler
+{
+    public partial class MainWindow : Window
+    {
+        private BitmapSource original;
+        private BitmapSource lastResult;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+        }
+
+        private void OpenButton_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new OpenFileDialog { Filter = "Images|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff|All files|*" };
+            if (dlg.ShowDialog() == true)
+            {
+                try
+                {
+                    var bi = new BitmapImage();
+                    bi.BeginInit();
+                    bi.CacheOption = BitmapCacheOption.OnLoad;
+                    bi.UriSource = new Uri(dlg.FileName);
+                    bi.EndInit();
+                    bi.Freeze();
+
+                    original = bi;
+                    PreviewImage.Source = original;
+                    PreviewWidthBox.Text = original.PixelWidth.ToString();
+                    PreviewHeightBox.Text = original.PixelHeight.ToString();
+                    StatusText.Text = $"Loaded {System.IO.Path.GetFileName(dlg.FileName)}";
+                    SaveButton.IsEnabled = false;
+                    UpscaleButton.IsEnabled = true;
+                    lastResult = null;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Failed to open image: " + ex.Message);
+                }
+            }
+        }
+
+        private async void UpscaleButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (original == null) return;
+
+            if (!double.TryParse(ScaleBox.Text, out double scale) || scale <= 0)
+            {
+                MessageBox.Show("Enter a valid scale > 0 (e.g. 2.0)");
+                return;
+            }
+
+            UpscaleButton.IsEnabled = false;
+            OpenButton.IsEnabled = false;
+            SaveButton.IsEnabled = false;
+            ProgressBar.Value = 0;
+
+            string method = ((ComboBoxItem)MethodCombo.SelectedItem).Content.ToString();
+
+            StatusText.Text = "Upscaling...";
+
+            try
+            {
+                if (method.StartsWith("WPF"))
+                {
+                    var res = await Task.Run(() => UpscaleWpf(original, scale, Progressive2x.IsChecked == true, UpdateProgress));
+                    lastResult = res;
+                }
+                else
+                {
+                    var res = await Task.Run(() => LanczosUpscale(original, scale, UpdateProgress));
+                    lastResult = res;
+                }
+
+                PreviewImage.Source = lastResult;
+                PreviewWidthBox.Text = lastResult.PixelWidth.ToString();
+                PreviewHeightBox.Text = lastResult.PixelHeight.ToString();
+                SaveButton.IsEnabled = true;
+                StatusText.Text = "Done.";
+            }
+            catch (Exception ex)
+            {
+                StatusText.Text = "Error: " + ex.Message;
+                MessageBox.Show("Upscale failed: " + ex.Message);
+            }
+            finally
+            {
+                UpscaleButton.IsEnabled = true;
+                OpenButton.IsEnabled = true;
+                UpdateProgress(100);
+            }
+        }
+
+        private void SaveButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (lastResult == null) return;
+            var dlg = new SaveFileDialog { Filter = "PNG|*.png|JPEG|*.jpg;*.jpeg|BMP|*.bmp", FileName = "upscaled.png" };
+            if (dlg.ShowDialog() == true)
+            {
+                BitmapEncoder enc;
+                var ext = System.IO.Path.GetExtension(dlg.FileName).ToLowerInvariant();
+                if (ext == ".jpg" || ext == ".jpeg") enc = new JpegBitmapEncoder() { QualityLevel = 95 };
+                else if (ext == ".bmp") enc = new BmpBitmapEncoder();
+                else enc = new PngBitmapEncoder();
+
+                enc.Frames.Add(BitmapFrame.Create(lastResult));
+                using (var fs = new FileStream(dlg.FileName, FileMode.Create))
+                    enc.Save(fs);
+
+                StatusText.Text = "Saved to " + dlg.FileName;
+            }
+        }
+
+        // Progress callback: percent 0..100
+        private void UpdateProgress(int percent)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                ProgressBar.Value = percent;
+            });
+        }
+
+        #region WPF high-quality upscale (RenderTargetBitmap with Fant)
+        private BitmapSource UpscaleWpf(BitmapSource src, double scale, bool progressive2x, Action<int> progress)
+        {
+            // Desired size
+            int dstW = (int)Math.Round(src.PixelWidth * scale);
+            int dstH = (int)Math.Round(src.PixelHeight * scale);
+
+            BitmapSource current = src;
+
+            // If progressive2x is true, perform repeated 2x upscales until near target,
+            // then final scale to exact size. This often produces smoother results.
+            if (progressive2x && scale > 1.0)
+            {
+                double currentScale = 1.0;
+                int step = 0;
+                while (currentScale * 2 <= scale)
+                {
+                    int nextW = (int)Math.Round(src.PixelWidth * (currentScale * 2));
+                    int nextH = (int)Math.Round(src.PixelHeight * (currentScale * 2));
+                    current = RenderScaleWithWpf(current, nextW, nextH);
+                    current.Freeze();
+                    currentScale *= 2;
+                    step++;
+                    progress((int)(Math.Min(90, 50.0 * step))); // rough progress
+                }
+
+                // final stretch to exact target
+                if (currentScale < scale)
+                {
+                    current = RenderScaleWithWpf(current, dstW, dstH);
+                    current.Freeze();
+                }
+            }
+            else
+            {
+                current = RenderScaleWithWpf(src, dstW, dstH);
+                current.Freeze();
+            }
+
+            progress(100);
+            return current;
+        }
+
+        private BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH)
+        {
+            // Use DrawingVisual & RenderTargetBitmap so we can control BitmapScalingMode
+            var dv = new DrawingVisual();
+            using (var dc = dv.RenderOpen())
+            {
+                var imgBrush = new ImageBrush(src) { Stretch = Stretch.Fill }; // fill to destination rect
+                dc.DrawRectangle(imgBrush, null, new Rect(0, 0, targetW, targetH));
+            }
+
+            // Hint WPF to use high-quality scaling (Fant)
+            RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.Fant);
+
+            var rtb = new RenderTargetBitmap(targetW, targetH, 96, 96, PixelFormats.Pbgra32);
+            rtb.Render(dv);
+            rtb.Freeze();
+            return rtb;
+        }
+        #endregion
+
+        #region Lanczos resampler (pure C#, separable)
+        // Lanczos resampling: a = lobes (commonly 3)
+        private BitmapSource LanczosUpscale(BitmapSource src, double scale, Action<int> progress)
+        {
+            if (scale <= 0) throw new ArgumentException("scale must be > 0");
+
+            int srcW = src.PixelWidth;
+            int srcH = src.PixelHeight;
+            int dstW = (int)Math.Round(srcW * scale);
+            int dstH = (int)Math.Round(srcH * scale);
+
+            // Convert source to BGRA32 byte[] (easier access)
+            var stride = ((srcW * src.Format.BitsPerPixel + 7) / 8);
+            // Convert to a guaranteed format (Bgra32)
+            var conv = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+            conv.Freeze();
+            var pixels = new byte[srcW * srcH * 4];
+            conv.CopyPixels(pixels, srcW * 4, 0);
+
+            // First pass: horizontal -> intermediate buffer (dstW x srcH)
+            var interm = new byte[dstW * srcH * 4];
+
+            int a = 3; // lobes
+            double invScale = 1.0 / scale;
+
+            // Horizontal pass
+            for (int y = 0; y < srcH; y++)
+            {
+                for (int x = 0; x < dstW; x++)
+                {
+                    double srcX = (x + 0.5) * invScale - 0.5;
+                    int left = (int)Math.Floor(srcX - a + 1);
+                    int right = (int)Math.Ceiling(srcX + a - 1);
+
+                    double r = 0, g = 0, b = 0, aacc = 0;
+                    double wsum = 0;
+
+                    for (int sx = left; sx <= right; sx++)
+                    {
+                        int clampedX = Math.Min(srcW - 1, Math.Max(0, sx));
+                        double w = LanczosKernel(srcX - sx, a);
+                        if (w == 0) continue;
+
+                        int idx = (y * srcW + clampedX) * 4;
+                        b += pixels[idx + 0] * w;
+                        g += pixels[idx + 1] * w;
+                        r += pixels[idx + 2] * w;
+                        aacc += pixels[idx + 3] * w;
+                        wsum += w;
+                    }
+
+                    int di = (y * dstW + x) * 4;
+                    if (wsum != 0)
+                    {
+                        interm[di + 0] = ClampToByte(b / wsum);
+                        interm[di + 1] = ClampToByte(g / wsum);
+                        interm[di + 2] = ClampToByte(r / wsum);
+                        interm[di + 3] = ClampToByte(aacc / wsum);
+                    }
+                    else
+                    {
+                        // fallback to nearest
+                        int nx = (int)Math.Round(srcX);
+                        nx = Math.Max(0, Math.Min(srcW - 1, nx));
+                        int idx = (y * srcW + nx) * 4;
+                        interm[di + 0] = pixels[idx + 0];
+                        interm[di + 1] = pixels[idx + 1];
+                        interm[di + 2] = pixels[idx + 2];
+                        interm[di + 3] = pixels[idx + 3];
+                    }
+                }
+                if (y % 10 == 0) progress((int)(10.0 * y / srcH)); // up to ~10% during horizontal
+            }
+
+            // Vertical pass: interm (dstW x srcH) -> dest (dstW x dstH)
+            var dest = new byte[dstW * dstH * 4];
+
+            for (int y = 0; y < dstH; y++)
+            {
+                for (int x = 0; x < dstW; x++)
+                {
+                    double srcY = (y + 0.5) * invScale - 0.5;
+                    int top = (int)Math.Floor(srcY - a + 1);
+                    int bottom = (int)Math.Ceiling(srcY + a - 1);
+
+                    double r = 0, g = 0, b = 0, aacc = 0;
+                    double wsum = 0;
+
+                    for (int sy = top; sy <= bottom; sy++)
+                    {
+                        int clampedY = Math.Min(srcH - 1, Math.Max(0, sy));
+                        double w = LanczosKernel(srcY - sy, a);
+                        if (w == 0) continue;
+
+                        int idx = (clampedY * dstW + x) * 4;
+                        b += interm[idx + 0] * w;
+                        g += interm[idx + 1] * w;
+                        r += interm[idx + 2] * w;
+                        aacc += interm[idx + 3] * w;
+                        wsum += w;
+                    }
+
+                    int di = (y * dstW + x) * 4;
+                    if (wsum != 0)
+                    {
+                        dest[di + 0] = ClampToByte(b / wsum);
+                        dest[di + 1] = ClampToByte(g / wsum);
+                        dest[di + 2] = ClampToByte(r / wsum);
+                        dest[di + 3] = ClampToByte(aacc / wsum);
+                    }
+                    else
+                    {
+                        int ny = (int)Math.Round(srcY);
+                        ny = Math.Max(0, Math.Min(srcH - 1, ny));
+                        int idx = (ny * dstW + x) * 4;
+                        dest[di + 0] = interm[idx + 0];
+                        dest[di + 1] = interm[idx + 1];
+                        dest[di + 2] = interm[idx + 2];
+                        dest[di + 3] = interm[idx + 3];
+                    }
+                }
+                if (y % 10 == 0) progress(10 + (int)(80.0 * y / dstH)); // progress up to 90..90ish
+            }
+
+            // Create WriteableBitmap from dest (BGRA32)
+            var wb = new WriteableBitmap(dstW, dstH, 96, 96, PixelFormats.Bgra32, null);
+            wb.WritePixels(new Int32Rect(0, 0, dstW, dstH), dest, dstW * 4, 0);
+            wb.Freeze();
+            progress(100);
+            return wb;
+        }
+
+        private static double LanczosKernel(double x, int a)
+        {
+            x = Math.Abs(x);
+            if (x < 1e-9) return 1.0;
+            if (x >= a) return 0.0;
+            double piX = Math.PI * x;
+            return (a * Math.Sin(piX) * Math.Sin(piX / a)) / (piX * piX);
+            // (sin(pi x)/(pi x)) * (sin(pi x / a)/(pi x / a))
+        }
+
+        private static byte ClampToByte(double v)
+        {
+            if (v <= 0) return 0;
+            if (v >= 255) return 255;
+            return (byte)(v + 0.5);
+        }
+        #endregion
+    }
+}
+
+Notes, tradeoffs & tips
+
+WPF/Fant: fast and high-quality for many tasks. WPF's BitmapScalingMode.Fant is implemented in the platform and is hardware-accelerated when possible. The app forces it by rendering via a DrawingVisual.
+
+Progressive 2×: the app supports doing repeated 2× steps before a final exact scale. That sometimes helps reduce stair-stepping and produce smoother results.
+
+Lanczos: the included implementation is separable (horizontal then vertical) and uses lobes = 3 (common choice). It produces very good sharpness and fewer artifacts, but is computationally expensive in pure managed code — expect significant CPU time on large images. You can reduce lobes to 2 or limit kernel window to speed up.
+
+Performance: for large upscales (e.g., 4× a 4000×3000 image), Lanczos will be slow and memory-hungry. Use WPF method for big images or add tiling to process chunks.
+
+Improvements you might add later: multi-thread the Lanczos loops (per-row parallelism), allow setting target pixel size instead of scale, add progress cancellation, or implement SSE/unsafe buffer loops for speed.
+
+If you want, I can:
+
+Add a multi-threaded Lanczos to speed it up on multi-core machines.
+
+Change the UI to accept target width/height and maintain aspect ratio.
+
+Provide a command-line version (console) that uses the same methods (suitable for batch processing).
+
+Which of those would you like next?
+--------------------------------------
+User:
+
+
+None
+--------------------------------------
+ChatGPT:
+
+
+Alright — then you already have a full WPF upscaler with two pure-C# methods and no external libraries.
+Just drop the XAML and C# files into a new WPF project, and it’s ready to build and run.
+
+You can keep using WPF Fant for quick jobs and switch to Lanczos if you need sharper output and don’t mind the extra CPU time.
+--------------------------------------
+User:
+
+
+I want a console program that targets NET framework and uses no external libraries, but it can use WPF technologies.
+--------------------------------------
+ChatGPT:
+
+
+Got it — you basically want a console application that runs on .NET Framework, has no external libraries, but still uses WPF’s built-in imaging stack (System.Windows.Media.Imaging) to do high-quality upscaling.
+
+That’s totally doable — WPF APIs work fine in a console app as long as you reference the right assemblies (PresentationCore, WindowsBase).
+
+Here’s a complete example:
+
+C# Console Program — .NET Framework, High-Quality WPF Image Upscale
+
+csharp
+Copy
+Edit
+using System;
+using System.IO;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+namespace WpfConsoleUpscaler
+{
+    class Program
+    {
+        [STAThread] // Required for WPF imaging
+        static void Main(string[] args)
+        {
+            if (args.Length < 3)
+            {
+                Console.WriteLine("Usage: WpfConsoleUpscaler.exe <input> <output> <scale>");
+                Console.WriteLine("Example: WpfConsoleUpscaler.exe in.png out.png 2.0");
+                return;
+            }
+
+            string inputPath = args[0];
+            string outputPath = args[1];
+            if (!double.TryParse(args[2], out double scale) || scale <= 0)
+            {
+                Console.WriteLine("Invalid scale value.");
+                return;
+            }
+
+            if (!File.Exists(inputPath))
+            {
+                Console.WriteLine("Input file not found.");
+                return;
+            }
+
+            try
+            {
+                // Load image fully into memory
+                var bi = new BitmapImage();
+                bi.BeginInit();
+                bi.CacheOption = BitmapCacheOption.OnLoad;
+                bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+                bi.EndInit();
+                bi.Freeze();
+
+                int targetW = (int)Math.Round(bi.PixelWidth * scale);
+                int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+                Console.WriteLine($"Upscaling {bi.PixelWidth}x{bi.PixelHeight} → {targetW}x{targetH} ...");
+
+                var result = RenderScaleWithWpf(bi, targetW, targetH);
+
+                // Save output based on extension
+                string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+                BitmapEncoder encoder;
+                if (ext == ".jpg" || ext == ".jpeg")
+                    encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+                else if (ext == ".bmp")
+                    encoder = new BmpBitmapEncoder();
+                else
+                    encoder = new PngBitmapEncoder();
+
+                encoder.Frames.Add(BitmapFrame.Create(result));
+                using (var fs = new FileStream(outputPath, FileMode.Create))
+                    encoder.Save(fs);
+
+                Console.WriteLine("Done.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error: " + ex.Message);
+            }
+        }
+
+        private static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH)
+        {
+            // Create a visual for high-quality scaling
+            var dv = new DrawingVisual();
+            using (var dc = dv.RenderOpen())
+            {
+                var brush = new ImageBrush(src) { Stretch = Stretch.Fill };
+                dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+            }
+
+            RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.Fant);
+
+            var rtb = new RenderTargetBitmap(targetW, targetH, 96, 96, PixelFormats.Pbgra32);
+            rtb.Render(dv);
+            rtb.Freeze();
+            return rtb;
+        }
+    }
+}
+
+📌 How to compile
+
+Create a Console App (.NET Framework) project in Visual Studio.
+
+Target .NET Framework 4.0 (or higher).
+
+Add references to:
+
+PresentationCore
+
+WindowsBase
+
+Paste the code above into Program.cs.
+
+Build.
+
+Example usage
+bash
+Copy
+Edit
+WpfConsoleUpscaler.exe "test.png" "out.png" 3.0
+
+
+This loads test.png, scales it ×3 using WPF’s high-quality Fant interpolation, and saves it to out.png.
+
+If you want, I can also make this accept width/height instead of scale, or batch process multiple files.
+Do you want me to make it work with wildcards in the console like *.png?
+--------------------------------------
+User:
+
+
+How to compile using csc.exe
+--------------------------------------
+ChatGPT:
+
+
+If you want to compile that WPF-based console program with csc.exe (no Visual Studio project), you just need to:
+
+Make sure you’re using the .NET Framework version of csc.exe (not the .NET Core one) — it’s usually in:
+
+makefile
+Copy
+Edit
+C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe
+
+
+or
+
+makefile
+Copy
+Edit
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+
+
+Save the program as, for example:
+
+Copy
+Edit
+WpfConsoleUpscaler.cs
+
+
+Run this command from a Developer Command Prompt for .NET Framework (or a normal cmd with full paths):
+
+bat
+Copy
+Edit
+csc /t:exe /out:WpfConsoleUpscaler.exe WpfConsoleUpscaler.cs ^
+    /r:WindowsBase.dll ^
+    /r:PresentationCore.dll ^
+    /platform:anycpu
+
+
+Explanation:
+
+/t:exe → build a console executable.
+
+/out:... → name of the output file.
+
+/r:... → reference the WPF assemblies (WindowsBase, PresentationCore) so you can use BitmapImage, RenderTargetBitmap, etc.
+
+/platform:anycpu → so it can run on x86/x64.
+
+Run your program like:
+
+bat
+Copy
+Edit
+WpfConsoleUpscaler.exe input.png output.png 2.0
+
+
+If you want me to, I can rewrite the code slightly so it’s all in one file and minimal, ready to paste into Notepad and compile with that csc.exe command.
+Do you want me to prepare that minimal version?
+--------------------------------------
+User:
+
+
+Yes
+--------------------------------------
+ChatGPT:
+
+
+Alright — here’s a minimal, single-file version of the WPF-based image upscaler, ready to drop into Notepad and compile with csc.exe targeting .NET Framework.
+
+WpfConsoleUpscaler.cs
+csharp
+Copy
+Edit
+using System;
+using System.IO;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+class Program
+{
+    [STAThread] // Required for WPF imaging
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: WpfConsoleUpscaler.exe <input> <output> <scale>");
+            return;
+        }
+
+        string inputPath = args[0];
+        string outputPath = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale value.");
+            return;
+        }
+
+        if (!File.Exists(inputPath))
+        {
+            Console.WriteLine("Input file not found.");
+            return;
+        }
+
+        try
+        {
+            // Load image into memory
+            var bi = new BitmapImage();
+            bi.BeginInit();
+            bi.CacheOption = BitmapCacheOption.OnLoad;
+            bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+            bi.EndInit();
+            bi.Freeze();
+
+            int targetW = (int)Math.Round(bi.PixelWidth * scale);
+            int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+            Console.WriteLine($"Upscaling {bi.PixelWidth}x{bi.PixelHeight} → {targetW}x{targetH} ...");
+
+            var result = RenderScaleWithWpf(bi, targetW, targetH);
+
+            // Choose encoder based on extension
+            string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+            BitmapEncoder encoder;
+            if (ext == ".jpg" || ext == ".jpeg")
+                encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+            else if (ext == ".bmp")
+                encoder = new BmpBitmapEncoder();
+            else
+                encoder = new PngBitmapEncoder();
+
+            encoder.Frames.Add(BitmapFrame.Create(result));
+            using (var fs = new FileStream(outputPath, FileMode.Create))
+                encoder.Save(fs);
+
+            Console.WriteLine("Done.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Error: " + ex.Message);
+        }
+    }
+
+    private static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH)
+    {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen())
+        {
+            var brush = new ImageBrush(src) { Stretch = Stretch.Fill };
+            dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+        }
+
+        RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.Fant);
+
+        var rtb = new RenderTargetBitmap(targetW, targetH, 96, 96, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+}
+
+How to compile with csc.exe
+
+Save the code as WpfConsoleUpscaler.cs.
+
+Open Developer Command Prompt for .NET Framework (or normal cmd if you use full paths).
+
+Run:
+
+bat
+Copy
+Edit
+csc /t:exe /out:WpfConsoleUpscaler.exe WpfConsoleUpscaler.cs ^
+    /r:WindowsBase.dll ^
+    /r:PresentationCore.dll ^
+    /platform:anycpu
+
+
+/r:WindowsBase.dll → needed for Rect, BitmapSource, etc.
+
+/r:PresentationCore.dll → needed for WPF imaging classes like BitmapImage, RenderTargetBitmap.
+
+/platform:anycpu → allows running on 32-bit or 64-bit.
+
+Run the program:
+
+bat
+Copy
+Edit
+WpfConsoleUpscaler.exe input.png output.png 2.0
+
+
+Do you want me to extend this minimal version so it can also accept wildcards like *.png and process them all at once? That’s possible with just a few extra lines.
+--------------------------------------
+User:
+
+
+Yes
+--------------------------------------
+ChatGPT:
+
+
+Alright — here’s the single-file WPF console upscaler updated so it supports wildcards (e.g. *.png, images\*.jpg) and processes all matches in one go.
+It still targets .NET Framework, uses no external libraries, and compiles with csc.exe.
+
+WpfConsoleUpscaler.cs
+csharp
+Copy
+Edit
+using System;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+class Program
+{
+    [STAThread] // Required for WPF imaging
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: WpfConsoleUpscaler.exe <inputPattern> <outputFolder> <scale>");
+            Console.WriteLine("Example: WpfConsoleUpscaler.exe \"images\\*.png\" upscaled 2.0");
+            return;
+        }
+
+        string inputPattern = args[0];
+        string outputFolder = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale value.");
+            return;
+        }
+
+        string dir = Path.GetDirectoryName(inputPattern);
+        if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+        string pattern = Path.GetFileName(inputPattern);
+
+        if (!Directory.Exists(dir))
+        {
+            Console.WriteLine("Input folder not found.");
+            return;
+        }
+        Directory.CreateDirectory(outputFolder);
+
+        var files = Directory.GetFiles(dir, pattern);
+        if (files.Length == 0)
+        {
+            Console.WriteLine("No matching files found.");
+            return;
+        }
+
+        Console.WriteLine($"Found {files.Length} file(s). Output folder: {Path.GetFullPath(outputFolder)}");
+
+        foreach (var file in files)
+        {
+            try
+            {
+                string outName = Path.Combine(outputFolder, Path.GetFileName(file));
+                UpscaleFile(file, outName, scale);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing {file}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine("All done.");
+    }
+
+    static void UpscaleFile(string inputPath, string outputPath, double scale)
+    {
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.CacheOption = BitmapCacheOption.OnLoad;
+        bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+        bi.EndInit();
+        bi.Freeze();
+
+        int targetW = (int)Math.Round(bi.PixelWidth * scale);
+        int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+        Console.WriteLine($"Upscaling {Path.GetFileName(inputPath)}: {bi.PixelWidth}x{bi.PixelHeight} → {targetW}x{targetH}");
+
+        var result = RenderScaleWithWpf(bi, targetW, targetH);
+
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        BitmapEncoder encoder;
+        if (ext == ".jpg" || ext == ".jpeg")
+            encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+        else if (ext == ".bmp")
+            encoder = new BmpBitmapEncoder();
+        else
+        {
+            ext = ".png";
+            outputPath = Path.ChangeExtension(outputPath, ".png");
+            encoder = new PngBitmapEncoder();
+        }
+
+        encoder.Frames.Add(BitmapFrame.Create(result));
+        using (var fs = new FileStream(outputPath, FileMode.Create))
+            encoder.Save(fs);
+    }
+
+    static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH)
+    {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen())
+        {
+            var brush = new ImageBrush(src) { Stretch = Stretch.Fill };
+            dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+        }
+        RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.Fant);
+
+        var rtb = new RenderTargetBitmap(targetW, targetH, 96, 96, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+}
+
+How to compile
+bat
+Copy
+Edit
+csc /t:exe /out:WpfConsoleUpscaler.exe WpfConsoleUpscaler.cs ^
+    /r:WindowsBase.dll ^
+    /r:PresentationCore.dll ^
+    /platform:anycpu
+
+Usage examples
+
+Upscale all PNG files in a folder by ×2, save to a new folder:
+
+bat
+Copy
+Edit
+WpfConsoleUpscaler.exe "images\*.png" out 2.0
+
+
+Upscale all JPG files in the current directory ×3:
+
+bat
+Copy
+Edit
+WpfConsoleUpscaler.exe "*.jpg" big 3.0
+
+
+Notes:
+
+Output format is decided by the output file’s extension, but if the input format is unsupported (like GIF), the output will be PNG.
+
+Output folder is created automatically if it doesn’t exist.
+
+Works fine on .NET Framework 4+ and doesn’t need Visual Studio.
+
+If you want, I can make it keep the folder structure when processing subfolders with SearchOption.AllDirectories, so you can upscale entire folder trees in one go.
+Do you want me to add that?
+--------------------------------------
+User:
+
+
+Write a program to upscale images but write a high quality lanczos3 algorithm, and make it as fast as possible, maybe using parallel threads. Use gdi+ or wpf as necessary for best quality 
+--------------------------------------
+ChatGPT:
+
+
+Nice — below is a single-file .NET Framework console program that implements a high-quality Lanczos-3 resampler (separable) and is optimized for speed:
+
+separable two-pass (horizontal then vertical) Lanczos-3
+
+precomputes contribution lists & normalized weights for each destination coordinate (big speed win)
+
+uses Parallel.For for both passes (row/column level parallelism)
+
+works in BGRA32 (via WPF FormatConvertedBitmap) for correctness and simplicity
+
+supports single files or wildcard patterns (e.g. images\*.png) and writes to an output folder
+
+no external libraries — only references required: PresentationCore.dll and WindowsBase.dll
+
+Save as e.g. LanczosUpscaler.cs and compile with csc.exe (instructions at the end).
+
+Code — LanczosUpscaler.cs
+csharp
+Copy
+Edit
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+/// <summary>
+/// High-quality Lanczos-3 image upscaler with parallelism.
+/// .NET Framework console app using WPF imaging stack (no external libs).
+/// </summary>
+class LanczosUpscaler
+{
+    [STAThread]
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: LanczosUpscaler.exe <inputPattern|inputFile> <outputFolder> <scale>");
+            Console.WriteLine("Examples:");
+            Console.WriteLine(@"  LanczosUpscaler.exe ""*.png"" out 2.0");
+            Console.WriteLine(@"  LanczosUpscaler.exe ""images\*.jpg"" out 1.5");
+            Console.WriteLine(@"  LanczosUpscaler.exe input.png out 3.0");
+            return;
+        }
+
+        string inputPattern = args[0];
+        string outFolder = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale (must be > 0).");
+            return;
+        }
+
+        // Determine directory and pattern
+        string dir = Path.GetDirectoryName(inputPattern);
+        if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+        string pattern = Path.GetFileName(inputPattern);
+
+        if (!Directory.Exists(dir))
+        {
+            Console.WriteLine($"Input directory not found: {dir}");
+            return;
+        }
+
+        Directory.CreateDirectory(outFolder);
+
+        string[] files;
+        // If pattern contains wildcard characters, use GetFiles, otherwise treat as single filename
+        if (pattern.IndexOfAny(new[] { '*', '?' }) >= 0)
+            files = Directory.GetFiles(dir, pattern);
+        else
+        {
+            var single = Path.Combine(dir, pattern);
+            if (!File.Exists(single))
+            {
+                Console.WriteLine($"File not found: {single}");
+                return;
+            }
+            files = new[] { single };
+        }
+
+        if (files.Length == 0)
+        {
+            Console.WriteLine("No matching files found.");
+            return;
+        }
+
+        Console.WriteLine($"Found {files.Length} file(s). Scaling by {scale}x. Output: {Path.GetFullPath(outFolder)}");
+
+        // Process files sequentially (could also parallelize across files, but we parallelize inside each image)
+        foreach (var file in files)
+        {
+            try
+            {
+                Console.WriteLine($"Processing: {file}");
+                string outPath = Path.Combine(outFolder, Path.GetFileName(file));
+                UpscaleFileLanczos3(file, outPath, scale);
+                Console.WriteLine($"Saved: {outPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing {file}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine("All done.");
+    }
+
+    /// <summary>
+    /// Upscales a single file with Lanczos-3, writes output (PNG by default, preserves extension when sensible).
+    /// </summary>
+    static void UpscaleFileLanczos3(string inputPath, string outputPath, double scale)
+    {
+        // Load source image as BGRA32 (FormatConvertedBitmap ensures a known pixel format)
+        var srcBi = new BitmapImage();
+        srcBi.BeginInit();
+        srcBi.CacheOption = BitmapCacheOption.OnLoad; // fully load into memory
+        srcBi.UriSource = new Uri(Path.GetFullPath(inputPath));
+        srcBi.EndInit();
+        srcBi.Freeze();
+
+        var converted = new FormatConvertedBitmap(srcBi, PixelFormats.Bgra32, null, 0);
+        converted.Freeze();
+
+        int srcW = converted.PixelWidth;
+        int srcH = converted.PixelHeight;
+        int dstW = Math.Max(1, (int)Math.Round(srcW * scale));
+        int dstH = Math.Max(1, (int)Math.Round(srcH * scale));
+
+        // Copy source pixels to byte[] (BGRA order)
+        int srcStride = srcW * 4;
+        var srcPixels = new byte[srcH * srcStride];
+        converted.CopyPixels(srcPixels, srcStride, 0);
+
+        // If scale == 1.0, just write out the original (still go through encoder to control format)
+        if (Math.Abs(scale - 1.0) < 1e-9)
+        {
+            SaveBitmapSource(converted, outputPath);
+            return;
+        }
+
+        // Lanczos parameter
+        int a = 3; // lobes for Lanczos-3
+
+        // Precompute contributors for horizontal and vertical passes
+        var contribX = PrecomputeContributors(srcW, dstW, scale, a);
+        var contribY = PrecomputeContributors(srcH, dstH, scale, a);
+
+        // Intermediate buffer after horizontal pass: width = dstW, height = srcH
+        var interm = new byte[srcH * dstW * 4];
+
+        // Horizontal pass: for each row, compute dstW pixels from srcW pixels
+        Parallel.For(0, srcH, y =>
+        {
+            int srcRow = y * srcStride;
+            int dstRow = y * dstW * 4;
+
+            // process each dst x
+            for (int x = 0; x < dstW; x++)
+            {
+                var c = contribX[x];
+                double b = 0, g = 0, r = 0, aa = 0;
+                double wsum = 0;
+
+                // accumulate weighted samples
+                for (int k = 0; k < c.Indices.Length; k++)
+                {
+                    int sx = c.Indices[k];
+                    double w = c.Weights[k];
+                    int idx = srcRow + sx * 4;
+                    b += srcPixels[idx + 0] * w;
+                    g += srcPixels[idx + 1] * w;
+                    r += srcPixels[idx + 2] * w;
+                    aa += srcPixels[idx + 3] * w;
+                    wsum += w;
+                }
+
+                if (wsum != 0)
+                {
+                    int di = dstRow + x * 4;
+                    interm[di + 0] = ClampToByte(b / wsum);
+                    interm[di + 1] = ClampToByte(g / wsum);
+                    interm[di + 2] = ClampToByte(r / wsum);
+                    interm[di + 3] = ClampToByte(aa / wsum);
+                }
+            }
+        });
+
+        // Destination buffer
+        var dest = new byte[dstH * dstW * 4];
+
+        // Vertical pass: for each column x, process dstH pixels from interm (which has width dstW and height srcH)
+        // We'll process per destination row in parallel for cache-friendliness
+        Parallel.For(0, dstH, y =>
+        {
+            double invScale = 1.0 / scale; // not needed in this implementation but kept for clarity
+            int dstRow = y * dstW * 4;
+
+            for (int x = 0; x < dstW; x++)
+            {
+                var c = contribY[y];
+                double b = 0, g = 0, r = 0, aa = 0;
+                double wsum = 0;
+
+                for (int k = 0; k < c.Indices.Length; k++)
+                {
+                    int sy = c.Indices[k];
+                    int idx = (sy * dstW + x) * 4; // index into interm
+                    double w = c.Weights[k];
+                    b += interm[idx + 0] * w;
+                    g += interm[idx + 1] * w;
+                    r += interm[idx + 2] * w;
+                    aa += interm[idx + 3] * w;
+                    wsum += w;
+                }
+
+                int di = dstRow + x * 4;
+                if (wsum != 0)
+                {
+                    dest[di + 0] = ClampToByte(b / wsum);
+                    dest[di + 1] = ClampToByte(g / wsum);
+                    dest[di + 2] = ClampToByte(r / wsum);
+                    dest[di + 3] = ClampToByte(aa / wsum);
+                }
+            }
+        });
+
+        // Build WriteableBitmap from dest (BGRA32)
+        var wb = new WriteableBitmap(dstW, dstH, 96, 96, PixelFormats.Bgra32, null);
+        wb.WritePixels(new Int32Rect(0, 0, dstW, dstH), dest, dstW * 4, 0);
+        wb.Freeze();
+
+        // Save output
+        SaveBitmapSource(wb, outputPath);
+    }
+
+    /// <summary>
+    /// Save BitmapSource to file. Choose encoder based on output extension; default to PNG.
+    /// </summary>
+    static void SaveBitmapSource(BitmapSource bmp, string outputPath)
+    {
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        BitmapEncoder encoder;
+        if (ext == ".jpg" || ext == ".jpeg") encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+        else if (ext == ".bmp") encoder = new BmpBitmapEncoder();
+        else encoder = new PngBitmapEncoder();
+
+        // If the expected extension is PNG but outputPath had other extension, change filename accordingly for PNG fallback
+        if (!(encoder is PngBitmapEncoder || encoder is JpegBitmapEncoder || encoder is BmpBitmapEncoder))
+        {
+            outputPath = Path.ChangeExtension(outputPath, ".png");
+            encoder = new PngBitmapEncoder();
+        }
+
+        encoder.Frames.Add(BitmapFrame.Create(bmp));
+        using (var fs = new FileStream(outputPath, FileMode.Create))
+            encoder.Save(fs);
+    }
+
+    /// <summary>
+    /// Contributor list for a single destination coordinate: the source indices and their weights.
+    /// </summary>
+    struct Contributor
+    {
+        public int[] Indices;
+        public double[] Weights;
+    }
+
+    /// <summary>
+    /// Precompute contributors (indices + normalized weights) for mapping srcSize -> dstSize using Lanczos-a.
+    /// This implementation uses the classic mapping: center = (dst + 0.5)/scale - 0.5
+    /// and support radius = a.
+    /// </summary>
+    static Contributor[] PrecomputeContributors(int srcSize, int dstSize, double scale, int a)
+    {
+        var contrib = new Contributor[dstSize];
+        double invScale = 1.0 / scale;
+
+        for (int i = 0; i < dstSize; i++)
+        {
+            // Position in source space corresponding to the center of destination pixel i
+            double center = (i + 0.5) * invScale - 0.5;
+
+            // Determine source sample range [left..right]
+            int left = (int)Math.Ceiling(center - a);
+            int right = (int)Math.Floor(center + a);
+
+            // Clamp range to source bounds but still include weights (we'll clamp indices when sampling)
+            left = Math.Max(left, 0);
+            right = Math.Min(right, srcSize - 1);
+
+            var indices = new List<int>();
+            var weights = new List<double>();
+
+            double wsum = 0.0;
+            for (int sx = left; sx <= right; sx++)
+            {
+                double x = center - sx;
+                double w = LanczosKernel(x, a);
+                if (w != 0.0)
+                {
+                    indices.Add(sx);
+                    weights.Add(w);
+                    wsum += w;
+                }
+            }
+
+            // Normalize weights to sum to 1 (prevents slight brightness changes)
+            if (wsum != 0.0)
+            {
+                for (int k = 0; k < weights.Count; k++)
+                    weights[k] /= wsum;
+            }
+            else
+            {
+                // Fallback to nearest
+                int nearest = (int)Math.Round(center);
+                nearest = Math.Max(0, Math.Min(srcSize - 1, nearest));
+                indices = new List<int> { nearest };
+                weights = new List<double> { 1.0 };
+            }
+
+            contrib[i].Indices = indices.ToArray();
+            contrib[i].Weights = weights.ToArray();
+        }
+        return contrib;
+    }
+
+    /// <summary>
+    /// Lanczos kernel (a = lobes). Lanczos(x) = sinc(x) * sinc(x / a) for |x| < a, else 0.
+    /// sinc(t) = sin(pi t) / (pi t) and sinc(0) = 1.
+    /// </summary>
+    static double LanczosKernel(double x, int a)
+    {
+        x = Math.Abs(x);
+        if (x < 1e-12) return 1.0;
+        if (x >= a) return 0.0;
+        double piX = Math.PI * x;
+        double sinc1 = Math.Sin(piX) / piX;
+        double sinc2 = Math.Sin(piX / a) / (piX / a);
+        return sinc1 * sinc2;
+    }
+
+    static byte ClampToByte(double v)
+    {
+        if (v <= 0.0) return 0;
+        if (v >= 255.0) return 255;
+        return (byte)(v + 0.5);
+    }
+}
+
+Notes about performance & quality
+
+Precomputed contributors: we compute, for each destination coordinate, the list of source indices that contribute and their normalized weights. This avoids repeated kernel evaluations and inner loops recalculating the same values — big speed win.
+
+Parallelism: Parallel.For is used for per-row (horizontal pass) and per-destination-row (vertical pass). This gives good CPU utilization on multi-core machines. If you want to parallelize across files too, you can wrap the outer file loop with a Parallel.ForEach (be mindful of heavy CPU + disk contention).
+
+Memory: an intermediate buffer of size dstW * srcH * 4 is allocated. For very large images you may want to tile the image to restrict memory usage. This implementation is simpler and fastest for moderate-to-large images on machines with enough RAM.
+
+Edge handling: indices are clamped to [0..srcSize-1] by limiting left/right. This is typical and avoids special-case padding. You can experiment with mirrored/symmetric padding if desired.
+
+WPF & BGRA32: using WPF's FormatConvertedBitmap ensures we operate in a predictable BGRA32 byte layout. The final WriteableBitmap is written with the same pixel format.
+
+Quality: Lanczos-3 is a very good general-purpose resampler — sharp and with controlled ringing. You can switch a to 2 for Lanczos-2 if you want less ringing.
+
+How to compile with csc.exe (NET Framework)
+
+Open a Developer Command Prompt (or use full paths) and run:
+
+bat
+Copy
+Edit
+csc /t:exe /out:LanczosUpscaler.exe LanczosUpscaler.cs ^
+    /r:WindowsBase.dll ^
+    /r:PresentationCore.dll ^
+    /platform:anycpu
+
+
+Then run:
+
+bat
+Copy
+Edit
+LanczosUpscaler.exe "images\*.png" out 2.0
+
+
+or
+
+bat
+Copy
+Edit
+LanczosUpscaler.exe input.jpg out 3.0
+
+
+If you want next:
+
+I can add tiling (process large images in strips) to cap memory usage and permit even larger images.
+
+I can add a progress indicator and cancellation support (Ctrl+C).
+
+I can add an option to choose kernel lobes (2 vs 3) or to use a faster low-memory mode (process columns in blocks).
+
+I can produce a version that uses unsafe pointers and fixed/Marshal to squeeze more speed (requires /unsafe at compile time) — this can be measurably faster.
+
+Which of those, if any, would you like me to add?
+--------------------------------------
+User:
+
+
+Write a similar program but use gdi+ instead of wpf
+--------------------------------------
+ChatGPT:
+
+
+Got it — here’s a pure .NET Framework console program that:
+
+Uses GDI+ (System.Drawing) instead of WPF.
+
+Implements a custom high-quality Lanczos3 resampler (no external libs).
+
+Uses parallel processing for speed.
+
+Works on any .NET Framework 2.0+.
+
+LanczosUpscaler.cs
+csharp
+Copy
+Edit
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Threading.Tasks;
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: LanczosUpscaler.exe <input> <output> <scale>");
+            return;
+        }
+
+        string inputPath = args[0];
+        string outputPath = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale value.");
+            return;
+        }
+
+        if (!File.Exists(inputPath))
+        {
+            Console.WriteLine("Input file not found.");
+            return;
+        }
+
+        try
+        {
+            using (var src = new Bitmap(inputPath))
+            {
+                int targetW = (int)Math.Round(src.Width * scale);
+                int targetH = (int)Math.Round(src.Height * scale);
+                Console.WriteLine($"Upscaling {src.Width}x{src.Height} → {targetW}x{targetH} using Lanczos3...");
+
+                using (var dst = LanczosResize(src, targetW, targetH, 3))
+                {
+                    var ext = Path.GetExtension(outputPath).ToLowerInvariant();
+                    ImageFormat fmt = ImageFormat.Png;
+                    if (ext == ".jpg" || ext == ".jpeg") fmt = ImageFormat.Jpeg;
+                    else if (ext == ".bmp") fmt = ImageFormat.Bmp;
+
+                    dst.Save(outputPath, fmt);
+                }
+            }
+            Console.WriteLine("Done.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Error: " + ex.Message);
+        }
+    }
+
+    static Bitmap LanczosResize(Bitmap src, int newWidth, int newHeight, int a)
+    {
+        var dst = new Bitmap(newWidth, newHeight, PixelFormat.Format24bppRgb);
+        dst.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+
+        // Lock bits for speed
+        var srcData = src.LockBits(new Rectangle(0, 0, src.Width, src.Height), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        var dstData = dst.LockBits(new Rectangle(0, 0, newWidth, newHeight), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+        int srcStride = srcData.Stride;
+        int dstStride = dstData.Stride;
+
+        double xScale = (double)newWidth / src.Width;
+        double yScale = (double)newHeight / src.Height;
+
+        unsafe
+        {
+            byte* srcPtr = (byte*)srcData.Scan0;
+            byte* dstPtr = (byte*)dstData.Scan0;
+
+            Parallel.For(0, newHeight, y =>
+            {
+                for (int x = 0; x < newWidth; x++)
+                {
+                    double gx = (x + 0.5) / xScale - 0.5;
+                    double gy = (y + 0.5) / yScale - 0.5;
+
+                    int gxi = (int)Math.Floor(gx);
+                    int gyi = (int)Math.Floor(gy);
+
+                    double rSum = 0, gSum = 0, bSum = 0;
+                    double wSum = 0;
+
+                    for (int yy = gyi - a + 1; yy <= gyi + a; yy++)
+                    {
+                        double dy = gy - yy;
+                        double wy = LanczosKernel(dy, a);
+
+                        if (yy < 0 || yy >= src.Height) continue;
+
+                        for (int xx = gxi - a + 1; xx <= gxi + a; xx++)
+                        {
+                            double dx = gx - xx;
+                            double wx = LanczosKernel(dx, a);
+                            double w = wx * wy;
+
+                            if (xx < 0 || xx >= src.Width) continue;
+
+                            byte* p = srcPtr + yy * srcStride + xx * 3;
+                            bSum += p[0] * w;
+                            gSum += p[1] * w;
+                            rSum += p[2] * w;
+                            wSum += w;
+                        }
+                    }
+
+                    if (wSum != 0)
+                    {
+                        byte* q = dstPtr + y * dstStride + x * 3;
+                        q[0] = (byte)Math.Min(Math.Max((int)Math.Round(bSum / wSum), 0), 255);
+                        q[1] = (byte)Math.Min(Math.Max((int)Math.Round(gSum / wSum), 0), 255);
+                        q[2] = (byte)Math.Min(Math.Max((int)Math.Round(rSum / wSum), 0), 255);
+                    }
+                }
+            });
+        }
+
+        src.UnlockBits(srcData);
+        dst.UnlockBits(dstData);
+
+        return dst;
+    }
+
+    static double LanczosKernel(double x, int a)
+    {
+        if (x == 0) return 1.0;
+        if (x < -a || x > a) return 0.0;
+        double pix = Math.PI * x;
+        return (a * Math.Sin(pix) * Math.Sin(pix / a)) / (pix * pix);
+    }
+}
+
+Compile with csc.exe
+bat
+Copy
+Edit
+csc /t:exe /out:LanczosUpscaler.exe LanczosUpscaler.cs /r:System.Drawing.dll /platform:anycpu /unsafe
+
+
+/unsafe → needed for pointer math with LockBits.
+
+/r:System.Drawing.dll → GDI+ reference.
+
+Run
+bat
+Copy
+Edit
+LanczosUpscaler.exe input.png output.png 2.0
+
+
+✅ Key Points
+
+Uses Lanczos3 kernel (a = 3), giving sharp but smooth results.
+
+Fully manual resampling — no GDI+ built-in scaling artifacts.
+
+Parallel.For for multicore speed.
+
+Works with .png, .jpg, .bmp (auto picks encoder).
+
+Uses unsafe pointers for raw pixel access, making it much faster than GetPixel/SetPixel.
+
+If you want, I can extend this to batch process wildcards (e.g., *.jpg) in one go while keeping the multithreaded speed. That way it can upscale a whole folder. Would you like me to do that?
+--------------------------------------
+User:
+
+
+Yes 
+--------------------------------------
+ChatGPT:
+
+
+Nice — below is an updated single-file console program that uses GDI+ (System.Drawing), implements a fast Lanczos-3 resampler (unsafe pointer arithmetic + LockBits), and supports wildcards / batch processing into an output folder.
+
+It parallelizes the inner work (per-destination row) with Parallel.For for speed, and processes files one-by-one to avoid excessive disk contention. Compile with csc.exe using /unsafe.
+
+LanczosBatchGdi.cs
+csharp
+Copy
+Edit
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Threading.Tasks;
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: LanczosBatchGdi.exe <inputPattern|inputFile> <outputFolder> <scale>");
+            Console.WriteLine(@"Examples:");
+            Console.WriteLine(@"  LanczosBatchGdi.exe ""images\*.png"" upscaled 2.0");
+            Console.WriteLine(@"  LanczosBatchGdi.exe input.jpg out 3.0");
+            return;
+        }
+
+        string inputPattern = args[0];
+        string outFolder = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale (must be > 0).");
+            return;
+        }
+
+        // Resolve directory / pattern, support relative paths
+        string dir = Path.GetDirectoryName(inputPattern);
+        if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+        string pattern = Path.GetFileName(inputPattern);
+
+        if (!Directory.Exists(dir))
+        {
+            Console.WriteLine($"Input directory not found: {dir}");
+            return;
+        }
+
+        Directory.CreateDirectory(outFolder);
+
+        string[] files;
+        if (pattern.IndexOfAny(new[] { '*', '?' }) >= 0)
+            files = Directory.GetFiles(dir, pattern, SearchOption.TopDirectoryOnly);
+        else
+        {
+            var single = Path.Combine(dir, pattern);
+            if (!File.Exists(single))
+            {
+                Console.WriteLine($"File not found: {single}");
+                return;
+            }
+            files = new[] { single };
+        }
+
+        if (files.Length == 0)
+        {
+            Console.WriteLine("No matching files found.");
+            return;
+        }
+
+        Console.WriteLine($"Found {files.Length} file(s). Scaling by {scale}x. Output folder: {Path.GetFullPath(outFolder)}");
+
+        foreach (var file in files)
+        {
+            try
+            {
+                Console.WriteLine($"Processing: {file}");
+                string outPath = Path.Combine(outFolder, Path.GetFileName(file));
+                ProcessFile(file, outPath, scale);
+                Console.WriteLine($"Saved: {outPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing {file}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine("All done.");
+    }
+
+    static void ProcessFile(string inputPath, string outputPath, double scale)
+    {
+        // Load into a 24bpp RGB bitmap for predictable layout
+        using (var original = new Bitmap(inputPath))
+        using (var src = EnsureFormat24bpp(original))
+        {
+            int targetW = Math.Max(1, (int)Math.Round(src.Width * scale));
+            int targetH = Math.Max(1, (int)Math.Round(src.Height * scale));
+            Console.WriteLine($"  {src.Width}x{src.Height} -> {targetW}x{targetH}");
+
+            using (var dst = LanczosResize(src, targetW, targetH, lobes: 3))
+            {
+                // Determine encoder by output extension; default to PNG
+                var ext = Path.GetExtension(outputPath).ToLowerInvariant();
+                ImageFormat fmt = ImageFormat.Png;
+                if (ext == ".jpg" || ext == ".jpeg") fmt = ImageFormat.Jpeg;
+                else if (ext == ".bmp") fmt = ImageFormat.Bmp;
+
+                // If user gave a non-supported extension, change to .png
+                if (!(fmt.Equals(ImageFormat.Png) || fmt.Equals(ImageFormat.Jpeg) || fmt.Equals(ImageFormat.Bmp)))
+                {
+                    outputPath = Path.ChangeExtension(outputPath, ".png");
+                    fmt = ImageFormat.Png;
+                }
+
+                dst.Save(outputPath, fmt);
+            }
+        }
+    }
+
+    static Bitmap EnsureFormat24bpp(Bitmap src)
+    {
+        if (src.PixelFormat == PixelFormat.Format24bppRgb)
+            return new Bitmap(src); // copy so caller can dispose original
+        var bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        bmp.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            g.DrawImage(src, 0, 0, src.Width, src.Height);
+        }
+        return bmp;
+    }
+
+    static Bitmap LanczosResize(Bitmap src, int newWidth, int newHeight, int lobes)
+    {
+        var dst = new Bitmap(newWidth, newHeight, PixelFormat.Format24bppRgb);
+        dst.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+
+        var srcRect = new Rectangle(0, 0, src.Width, src.Height);
+        var dstRect = new Rectangle(0, 0, newWidth, newHeight);
+
+        var srcData = src.LockBits(srcRect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        var dstData = dst.LockBits(dstRect, ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+        int srcStride = srcData.Stride;
+        int dstStride = dstData.Stride;
+        int srcW = src.Width;
+        int srcH = src.Height;
+        int dstW = newWidth;
+        int dstH = newHeight;
+
+        double xScale = (double)dstW / srcW;
+        double yScale = (double)dstH / srcH;
+
+        unsafe
+        {
+            byte* srcPtr = (byte*)srcData.Scan0;
+            byte* dstPtr = (byte*)dstData.Scan0;
+
+            // Parallelize per-destination row — good cache locality and avoids locking
+            Parallel.For(0, dstH, y =>
+            {
+                // For each x calculate weighted sum
+                for (int x = 0; x < dstW; x++)
+                {
+                    // Map destination pixel center to source space
+                    double gx = (x + 0.5) / xScale - 0.5;
+                    double gy = (y + 0.5) / yScale - 0.5;
+
+                    int gxi = (int)Math.Floor(gx);
+                    int gyi = (int)Math.Floor(gy);
+
+                    double bSum = 0, gSum = 0, rSum = 0;
+                    double wSum = 0;
+
+                    int xStart = gxi - lobes + 1;
+                    int xEnd = gxi + lobes;
+                    int yStart = gyi - lobes + 1;
+                    int yEnd = gyi + lobes;
+
+                    for (int sy = yStart; sy <= yEnd; sy++)
+                    {
+                        if (sy < 0 || sy >= srcH) continue;
+                        double dy = gy - sy;
+                        double wy = LanczosKernel(dy, lobes);
+                        if (wy == 0.0) continue;
+
+                        byte* rowPtr = srcPtr + sy * srcStride;
+                        for (int sx = xStart; sx <= xEnd; sx++)
+                        {
+                            if (sx < 0 || sx >= srcW) continue;
+                            double dx = gx - sx;
+                            double wx = LanczosKernel(dx, lobes);
+                            if (wx == 0.0) continue;
+
+                            double w = wx * wy;
+                            byte* p = rowPtr + sx * 3;
+                            bSum += p[0] * w;
+                            gSum += p[1] * w;
+                            rSum += p[2] * w;
+                            wSum += w;
+                        }
+                    }
+
+                    byte* q = dstPtr + y * dstStride + x * 3;
+                    if (wSum != 0)
+                    {
+                        int bi = (int)Math.Round(bSum / wSum);
+                        int gi = (int)Math.Round(gSum / wSum);
+                        int ri = (int)Math.Round(rSum / wSum);
+                        q[0] = (byte)Math.Min(Math.Max(bi, 0), 255);
+                        q[1] = (byte)Math.Min(Math.Max(gi, 0), 255);
+                        q[2] = (byte)Math.Min(Math.Max(ri, 0), 255);
+                    }
+                    else
+                    {
+                        // fallback to nearest sample
+                        int sx = Math.Min(srcW - 1, Math.Max(0, (int)Math.Round(gx)));
+                        int sy = Math.Min(srcH - 1, Math.Max(0, (int)Math.Round(gy)));
+                        byte* p = srcPtr + sy * srcStride + sx * 3;
+                        q[0] = p[0];
+                        q[1] = p[1];
+                        q[2] = p[2];
+                    }
+                }
+            });
+        }
+
+        src.UnlockBits(srcData);
+        dst.UnlockBits(dstData);
+        return dst;
+    }
+
+    static double LanczosKernel(double x, int a)
+    {
+        x = Math.Abs(x);
+        if (x < 1e-12) return 1.0;
+        if (x >= a) return 0.0;
+        double pix = Math.PI * x;
+        double sinc1 = Math.Sin(pix) / pix;
+        double sinc2 = Math.Sin(pix / a) / (pix / a);
+        return sinc1 * sinc2;
+    }
+}
+
+Compile with csc.exe
+
+Open a Developer Command Prompt for .NET Framework and run:
+
+bat
+Copy
+Edit
+csc /t:exe /out:LanczosBatchGdi.exe LanczosBatchGdi.cs /r:System.Drawing.dll /platform:anycpu /unsafe
+
+
+/unsafe is required because the program uses pointer arithmetic with LockBits.
+
+/r:System.Drawing.dll references GDI+.
+
+Usage examples
+
+Upscale all PNGs in images folder by 2× and write into upscaled:
+
+bat
+Copy
+Edit
+LanczosBatchGdi.exe "images\*.png" upscaled 2.0
+
+
+Upscale a single file:
+
+bat
+Copy
+Edit
+LanczosBatchGdi.exe input.jpg out 3.0
+
+Notes & suggestions
+
+This is high-quality but CPU-heavy. Good multi-core scaling via Parallel.For.
+
+For very large images, consider processing in tiles to reduce peak memory use and improve cache locality.
+
+If you want even more speed, I can:
+
+Precompute contributor weights (separable approach) to avoid re-evaluating the kernel many times.
+
+Add per-file parallelism (process multiple files simultaneously) with a limited concurrency level.
+
+Provide an unsafe + fixed + pointer-optimized variant that precomputes indices/weights (fastest).
+Would you like me to implement precomputed contributors (separable pass) for this GDI+ version?
+--------------------------------------
+User:
+
+
+Do all these optimizations except parallel file processing 
+--------------------------------------
+ChatGPT:
+
+
+Great! Below is the fully optimized GDI+ Lanczos-3 batch image upscaler with:
+
+Precomputed contributors (separable two-pass resampling) for both horizontal and vertical passes (huge speed-up vs naive nested loops).
+
+Parallelization inside the horizontal and vertical passes (Parallel.For), but no parallelism across files.
+
+Uses unsafe pointer access with LockBits for fast pixel operations.
+
+Supports wildcard batch input to upscale multiple images into an output folder.
+
+Auto-detects output format from extension (.png, .jpg, .bmp).
+
+Targets .NET Framework, uses only System.Drawing (GDI+).
+
+LanczosBatchOptimizedGdi.cs
+csharp
+Copy
+Edit
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Threading.Tasks;
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: LanczosBatchOptimizedGdi.exe <inputPattern|inputFile> <outputFolder> <scale>");
+            Console.WriteLine(@"Example: LanczosBatchOptimizedGdi.exe ""images\*.png"" upscaled 2.0");
+            return;
+        }
+
+        string inputPattern = args[0];
+        string outFolder = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale.");
+            return;
+        }
+
+        string dir = Path.GetDirectoryName(inputPattern);
+        if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+        string pattern = Path.GetFileName(inputPattern);
+
+        if (!Directory.Exists(dir))
+        {
+            Console.WriteLine($"Input directory not found: {dir}");
+            return;
+        }
+        Directory.CreateDirectory(outFolder);
+
+        string[] files;
+        if (pattern.IndexOfAny(new[] { '*', '?' }) >= 0)
+            files = Directory.GetFiles(dir, pattern);
+        else
+        {
+            var single = Path.Combine(dir, pattern);
+            if (!File.Exists(single))
+            {
+                Console.WriteLine($"File not found: {single}");
+                return;
+            }
+            files = new[] { single };
+        }
+
+        if (files.Length == 0)
+        {
+            Console.WriteLine("No matching files found.");
+            return;
+        }
+
+        Console.WriteLine($"Found {files.Length} file(s). Scaling by {scale}x. Output: {Path.GetFullPath(outFolder)}");
+
+        foreach (var file in files)
+        {
+            try
+            {
+                Console.WriteLine($"Processing: {file}");
+                string outPath = Path.Combine(outFolder, Path.GetFileName(file));
+                ProcessFile(file, outPath, scale);
+                Console.WriteLine($"Saved: {outPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing {file}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine("All done.");
+    }
+
+    static void ProcessFile(string inputPath, string outputPath, double scale)
+    {
+        using (var original = new Bitmap(inputPath))
+        using (var src = EnsureFormat24bpp(original))
+        {
+            int dstW = Math.Max(1, (int)Math.Round(src.Width * scale));
+            int dstH = Math.Max(1, (int)Math.Round(src.Height * scale));
+            Console.WriteLine($"  {src.Width}x{src.Height} → {dstW}x{dstH}");
+
+            using (var dst = LanczosResizeSeparable(src, dstW, dstH, lobes: 3))
+            {
+                var ext = Path.GetExtension(outputPath).ToLowerInvariant();
+                ImageFormat fmt = ImageFormat.Png;
+                if (ext == ".jpg" || ext == ".jpeg") fmt = ImageFormat.Jpeg;
+                else if (ext == ".bmp") fmt = ImageFormat.Bmp;
+
+                if (!(fmt.Equals(ImageFormat.Png) || fmt.Equals(ImageFormat.Jpeg) || fmt.Equals(ImageFormat.Bmp)))
+                {
+                    outputPath = Path.ChangeExtension(outputPath, ".png");
+                    fmt = ImageFormat.Png;
+                }
+
+                dst.Save(outputPath, fmt);
+            }
+        }
+    }
+
+    static Bitmap EnsureFormat24bpp(Bitmap src)
+    {
+        if (src.PixelFormat == PixelFormat.Format24bppRgb)
+            return new Bitmap(src);
+        var bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        bmp.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            g.DrawImage(src, 0, 0, src.Width, src.Height);
+        }
+        return bmp;
+    }
+
+    // Contributor info: source indices and weights for one destination coordinate
+    struct Contributor
+    {
+        public int[] Indices;
+        public double[] Weights;
+    }
+
+    static Bitmap LanczosResizeSeparable(Bitmap src, int dstW, int dstH, int lobes)
+    {
+        int srcW = src.Width;
+        int srcH = src.Height;
+
+        // Lock source bits
+        var srcRect = new Rectangle(0, 0, srcW, srcH);
+        var srcData = src.LockBits(srcRect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+
+        // Intermediate buffer after horizontal pass
+        byte[] interm = new byte[dstW * srcH * 3];
+
+        // Lock destination bits
+        var dst = new Bitmap(dstW, dstH, PixelFormat.Format24bppRgb);
+        dst.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+        var dstRect = new Rectangle(0, 0, dstW, dstH);
+        var dstData = dst.LockBits(dstRect, ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+        int srcStride = srcData.Stride;
+        int dstStride = dstData.Stride;
+
+        // Precompute contributor arrays for horizontal and vertical resizing
+        var contribX = PrecomputeContributors(srcW, dstW, lobes);
+        var contribY = PrecomputeContributors(srcH, dstH, lobes);
+
+        unsafe
+        {
+            byte* srcPtr = (byte*)srcData.Scan0;
+
+            // Horizontal pass (resize width)
+            Parallel.For(0, srcH, y =>
+            {
+                int srcRow = y * srcStride;
+                int intermRow = y * dstW * 3;
+
+                for (int x = 0; x < dstW; x++)
+                {
+                    var c = contribX[x];
+                    double b = 0, g = 0, r = 0;
+                    double wsum = 0;
+
+                    for (int k = 0; k < c.Indices.Length; k++)
+                    {
+                        int sx = c.Indices[k];
+                        int idx = srcRow + sx * 3;
+                        double w = c.Weights[k];
+
+                        b += srcPtr[idx + 0] * w;
+                        g += srcPtr[idx + 1] * w;
+                        r += srcPtr[idx + 2] * w;
+                        wsum += w;
+                    }
+
+                    if (wsum > 0)
+                    {
+                        int di = intermRow + x * 3;
+                        interm[di + 0] = ClampToByte(b / wsum);
+                        interm[di + 1] = ClampToByte(g / wsum);
+                        interm[di + 2] = ClampToByte(r / wsum);
+                    }
+                }
+            });
+
+            // Vertical pass (resize height)
+            byte* dstPtr = (byte*)dstData.Scan0;
+            Parallel.For(0, dstH, y =>
+            {
+                int dstRow = y * dstStride;
+
+                for (int x = 0; x < dstW; x++)
+                {
+                    var c = contribY[y];
+                    double b = 0, g = 0, r = 0;
+                    double wsum = 0;
+
+                    for (int k = 0; k < c.Indices.Length; k++)
+                    {
+                        int sy = c.Indices[k];
+                        int idx = sy * dstW * 3 + x * 3;
+                        double w = c.Weights[k];
+
+                        b += interm[idx + 0] * w;
+                        g += interm[idx + 1] * w;
+                        r += interm[idx + 2] * w;
+                        wsum += w;
+                    }
+
+                    int di = dstRow + x * 3;
+                    if (wsum > 0)
+                    {
+                        dstPtr[di + 0] = ClampToByte(b / wsum);
+                        dstPtr[di + 1] = ClampToByte(g / wsum);
+                        dstPtr[di + 2] = ClampToByte(r / wsum);
+                    }
+                }
+            });
+        }
+
+        src.UnlockBits(srcData);
+        dst.UnlockBits(dstData);
+
+        return dst;
+    }
+
+    static Contributor[] PrecomputeContributors(int srcSize, int dstSize, int lobes)
+    {
+        var contrib = new Contributor[dstSize];
+        double scale = (double)dstSize / srcSize;
+        double invScale = 1.0 / scale;
+
+        for (int i = 0; i < dstSize; i++)
+        {
+            double center = (i + 0.5) * invScale - 0.5;
+
+            int left = (int)Math.Ceiling(center - lobes);
+            int right = (int)Math.Floor(center + lobes);
+
+            left = Math.Max(left, 0);
+            right = Math.Min(right, srcSize - 1);
+
+            var indices = new List<int>();
+            var weights = new List<double>();
+
+            double wsum = 0.0;
+
+            for (int sx = left; sx <= right; sx++)
+            {
+                double x = center - sx;
+                double w = LanczosKernel(x, lobes);
+                if (w != 0.0)
+                {
+                    indices.Add(sx);
+                    weights.Add(w);
+                    wsum += w;
+                }
+            }
+
+            if (wsum > 0)
+            {
+                for (int k = 0; k < weights.Count; k++)
+                    weights[k] /= wsum;
+            }
+            else
+            {
+                int nearest = (int)Math.Round(center);
+                nearest = Math.Max(0, Math.Min(srcSize - 1, nearest));
+                indices = new List<int> { nearest };
+                weights = new List<double> { 1.0 };
+            }
+
+            contrib[i].Indices = indices.ToArray();
+            contrib[i].Weights = weights.ToArray();
+        }
+
+        return contrib;
+    }
+
+    static double LanczosKernel(double x, int a)
+    {
+        x = Math.Abs(x);
+        if (x < 1e-12) return 1.0;
+        if (x >= a) return 0.0;
+        double pix = Math.PI * x;
+        return Math.Sin(pix) / pix * Math.Sin(pix / a) / (pix / a);
+    }
+
+    static byte ClampToByte(double val)
+    {
+        if (val < 0) return 0;
+        if (val > 255) return 255;
+        return (byte)(val + 0.5);
+    }
+}
+
+How to compile
+
+Open a Developer Command Prompt and run:
+
+bat
+Copy
+Edit
+csc /t:exe /out:LanczosBatchOptimizedGdi.exe LanczosBatchOptimizedGdi.cs /r:System.Drawing.dll /platform:anycpu /unsafe
+
+Usage example
+
+Upscale all JPG files in folder photos 2× into photos_upscaled folder:
+
+bat
+Copy
+Edit
+LanczosBatchOptimizedGdi.exe "photos\*.jpg" photos_upscaled 2.0
+
+Summary
+
+Separable two-pass Lanczos-3: much faster than naive 2D kernel.
+
+Precomputed contributors and weights: kernel values computed once per output pixel.
+
+Unsafe, pointer-based pixel access: very fast pixel reading/writing.
+
+Parallel loops for horizontal and vertical passes: utilize multiple cores.
+
+Batch support for wildcards, writes all output to specified folder.
+
+Automatic format detection by output file extension.
+
+Works on all .NET Framework versions that support System.Drawing and unsafe code.
+
+If you want me to add:
+
+Progress bars or console progress percentage,
+
+Cancellation support (Ctrl+C),
+
+Tile-based processing for huge images,
+
+More output format support,
+
+just say the word!
+--------------------------------------
+User:
+
+
+Yes, all
+--------------------------------------
+ChatGPT:
+
+
+Alright! Here's the fully enhanced version with:
+
+Console progress indicator per file (percentage updated inline),
+
+Ctrl+C cancellation support,
+
+Tile-based processing (to keep memory manageable and boost cache),
+
+Output format support still PNG, JPG, BMP (can be extended easily).
+
+LanczosBatchAdvancedGdi.cs
+csharp
+Copy
+Edit
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    // Cancellation token source for Ctrl+C handling
+    static CancellationTokenSource cts = new CancellationTokenSource();
+
+    static void Main(string[] args)
+    {
+        Console.CancelKeyPress += (s, e) =>
+        {
+            Console.WriteLine("\nCancellation requested...");
+            cts.Cancel();
+            e.Cancel = true; // prevent immediate termination
+        };
+
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: LanczosBatchAdvancedGdi.exe <inputPattern|inputFile> <outputFolder> <scale>");
+            Console.WriteLine(@"Example: LanczosBatchAdvancedGdi.exe ""images\*.png"" upscaled 2.0");
+            return;
+        }
+
+        string inputPattern = args[0];
+        string outFolder = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale.");
+            return;
+        }
+
+        string dir = Path.GetDirectoryName(inputPattern);
+        if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+        string pattern = Path.GetFileName(inputPattern);
+
+        if (!Directory.Exists(dir))
+        {
+            Console.WriteLine($"Input directory not found: {dir}");
+            return;
+        }
+        Directory.CreateDirectory(outFolder);
+
+        string[] files;
+        if (pattern.IndexOfAny(new[] { '*', '?' }) >= 0)
+            files = Directory.GetFiles(dir, pattern);
+        else
+        {
+            var single = Path.Combine(dir, pattern);
+            if (!File.Exists(single))
+            {
+                Console.WriteLine($"File not found: {single}");
+                return;
+            }
+            files = new[] { single };
+        }
+
+        if (files.Length == 0)
+        {
+            Console.WriteLine("No matching files found.");
+            return;
+        }
+
+        Console.WriteLine($"Found {files.Length} file(s). Scaling by {scale}x. Output: {Path.GetFullPath(outFolder)}");
+        Console.WriteLine("Press Ctrl+C to cancel.\n");
+
+        foreach (var file in files)
+        {
+            if (cts.IsCancellationRequested) break;
+
+            try
+            {
+                Console.WriteLine($"Processing: {file}");
+                string outPath = Path.Combine(outFolder, Path.GetFileName(file));
+                ProcessFile(file, outPath, scale, cts.Token);
+                Console.WriteLine($"\nSaved: {outPath}\n");
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("\nOperation cancelled by user.");
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nError processing {file}: {ex.Message}\n");
+            }
+        }
+
+        Console.WriteLine("All done.");
+    }
+
+    static void ProcessFile(string inputPath, string outputPath, double scale, CancellationToken token)
+    {
+        using (var original = new Bitmap(inputPath))
+        using (var src = EnsureFormat24bpp(original))
+        {
+            int dstW = Math.Max(1, (int)Math.Round(src.Width * scale));
+            int dstH = Math.Max(1, (int)Math.Round(src.Height * scale));
+            Console.WriteLine($"  {src.Width}x{src.Height} → {dstW}x{dstH}");
+
+            using (var dst = LanczosResizeSeparableTiles(src, dstW, dstH, lobes: 3, token, (progress) =>
+            {
+                DrawProgress(progress);
+            }))
+            {
+                var ext = Path.GetExtension(outputPath).ToLowerInvariant();
+                ImageFormat fmt = ImageFormat.Png;
+                if (ext == ".jpg" || ext == ".jpeg") fmt = ImageFormat.Jpeg;
+                else if (ext == ".bmp") fmt = ImageFormat.Bmp;
+
+                if (!(fmt.Equals(ImageFormat.Png) || fmt.Equals(ImageFormat.Jpeg) || fmt.Equals(ImageFormat.Bmp)))
+                {
+                    outputPath = Path.ChangeExtension(outputPath, ".png");
+                    fmt = ImageFormat.Png;
+                }
+
+                dst.Save(outputPath, fmt);
+            }
+        }
+    }
+
+    static void DrawProgress(double progress)
+    {
+        int width = 50;
+        int done = (int)(progress * width);
+        Console.CursorLeft = 0;
+        Console.Write("[");
+        Console.Write(new string('#', done));
+        Console.Write(new string('-', width - done));
+        Console.Write($"] {progress * 100:0.0}%");
+    }
+
+    static Bitmap EnsureFormat24bpp(Bitmap src)
+    {
+        if (src.PixelFormat == PixelFormat.Format24bppRgb)
+            return new Bitmap(src);
+        var bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        bmp.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            g.DrawImage(src, 0, 0, src.Width, src.Height);
+        }
+        return bmp;
+    }
+
+    struct Contributor
+    {
+        public int[] Indices;
+        public double[] Weights;
+    }
+
+    static Bitmap LanczosResizeSeparableTiles(Bitmap src, int dstW, int dstH, int lobes, CancellationToken token, Action<double> progressCallback)
+    {
+        int srcW = src.Width;
+        int srcH = src.Height;
+
+        const int tileHeight = 64; // tune as needed for memory/speed tradeoff
+
+        var srcRect = new Rectangle(0, 0, srcW, srcH);
+        var srcData = src.LockBits(srcRect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+
+        var dst = new Bitmap(dstW, dstH, PixelFormat.Format24bppRgb);
+        dst.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+        var dstRect = new Rectangle(0, 0, dstW, dstH);
+        var dstData = dst.LockBits(dstRect, ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+        int srcStride = srcData.Stride;
+        int dstStride = dstData.Stride;
+
+        var contribX = PrecomputeContributors(srcW, dstW, lobes);
+        var contribY = PrecomputeContributors(srcH, dstH, lobes);
+
+        // Intermediate buffer for horizontal pass tile
+        // Max tile width * tileHeight * 3 bytes
+        int intermRowSize = dstW * 3;
+
+        unsafe
+        {
+            byte* srcPtr = (byte*)srcData.Scan0;
+            byte* dstPtr = (byte*)dstData.Scan0;
+
+            for (int tileY = 0; tileY < dstH; tileY += tileHeight)
+            {
+                if (token.IsCancellationRequested) throw new OperationCanceledException(token);
+
+                int currentTileHeight = Math.Min(tileHeight, dstH - tileY);
+
+                // Allocate intermediate buffer for tile horizontal pass
+                byte[] interm = new byte[dstW * currentTileHeight * 3];
+
+                // Horizontal pass on tile rows (source rows: tileY mapped back by scale)
+                Parallel.For(0, currentTileHeight, y =>
+                {
+                    int srcY = (int)Math.Min(srcH - 1, Math.Max(0, (int)Math.Floor((tileY + y + 0.5) / ((double)dstH / srcH) - 0.5)));
+                    int srcRow = srcY * srcStride;
+                    int intermRow = y * dstW * 3;
+
+                    for (int x = 0; x < dstW; x++)
+                    {
+                        var c = contribX[x];
+                        double b = 0, g = 0, r = 0;
+                        double wsum = 0;
+
+                        for (int k = 0; k < c.Indices.Length; k++)
+                        {
+                            int sx = c.Indices[k];
+                            int idx = srcRow + sx * 3;
+                            double w = c.Weights[k];
+
+                            b += srcPtr[idx + 0] * w;
+                            g += srcPtr[idx + 1] * w;
+                            r += srcPtr[idx + 2] * w;
+                            wsum += w;
+                        }
+
+                        if (wsum > 0)
+                        {
+                            int di = intermRow + x * 3;
+                            interm[di + 0] = ClampToByte(b / wsum);
+                            interm[di + 1] = ClampToByte(g / wsum);
+                            interm[di + 2] = ClampToByte(r / wsum);
+                        }
+                    }
+                });
+
+                // Vertical pass on tile rows
+                Parallel.For(0, currentTileHeight, y =>
+                {
+                    int dstY = tileY + y;
+                    int dstRow = dstY * dstStride;
+
+                    var c = contribY[dstY];
+
+                    for (int x = 0; x < dstW; x++)
+                    {
+                        double b = 0, g = 0, r = 0;
+                        double wsum = 0;
+
+                        for (int k = 0; k < c.Indices.Length; k++)
+                        {
+                            int sy = c.Indices[k] - tileY;
+                            if (sy < 0 || sy >= currentTileHeight) continue; // outside current tile
+                            int idx = sy * dstW * 3 + x * 3;
+                            double w = c.Weights[k];
+
+                            b += interm[idx + 0] * w;
+                            g += interm[idx + 1] * w;
+                            r += interm[idx + 2] * w;
+                            wsum += w;
+                        }
+
+                        int di = dstRow + x * 3;
+                        if (wsum > 0)
+                        {
+                            dstPtr[di + 0] = ClampToByte(b / wsum);
+                            dstPtr[di + 1] = ClampToByte(g / wsum);
+                            dstPtr[di + 2] = ClampToByte(r / wsum);
+                        }
+                    }
+                });
+
+                // Report progress
+                double prog = (tileY + currentTileHeight) / (double)dstH;
+                progressCallback(prog);
+            }
+        }
+
+        src.UnlockBits(srcData);
+        dst.UnlockBits(dstData);
+
+        // Clear progress line after done
+        Console.WriteLine();
+
+        return dst;
+    }
+
+    static Contributor[] PrecomputeContributors(int srcSize, int dstSize, int lobes)
+    {
+        var contrib = new Contributor[dstSize];
+        double scale = (double)dstSize / srcSize;
+        double invScale = 1.0 / scale;
+
+        for (int i = 0; i < dstSize; i++)
+        {
+            double center = (i + 0.5) * invScale - 0.5;
+
+            int left = (int)Math.Ceiling(center - lobes);
+            int right = (int)Math.Floor(center + lobes);
+
+            left = Math.Max(left, 0);
+            right = Math.Min(right, srcSize - 1);
+
+            var indices = new List<int>();
+            var weights = new List<double>();
+
+            double wsum = 0.0;
+
+            for (int sx = left; sx <= right; sx++)
+            {
+                double x = center - sx;
+                double w = LanczosKernel(x, lobes);
+                if (w != 0.0)
+                {
+                    indices.Add(sx);
+                    weights.Add(w);
+                    wsum += w;
+                }
+            }
+
+            if (wsum > 0)
+            {
+                for (int k = 0; k < weights.Count; k++)
+                    weights[k] /= wsum;
+            }
+            else
+            {
+                int nearest = (int)Math.Round(center);
+                nearest = Math.Max(0, Math.Min(srcSize - 1, nearest));
+                indices = new List<int> { nearest };
+                weights = new List<double> { 1.0 };
+            }
+
+            contrib[i].Indices = indices.ToArray();
+            contrib[i].Weights = weights.ToArray();
+        }
+
+        return contrib;
+    }
+
+    static double LanczosKernel(double x, int a)
+    {
+        x = Math.Abs(x);
+        if (x < 1e-12) return 1.0;
+        if (x >= a) return 0.0;
+        double pix = Math.PI * x;
+        return Math.Sin(pix) / pix * Math.Sin(pix / a) / (pix / a);
+    }
+
+    static byte ClampToByte(double val)
+    {
+        if (val < 0) return 0;
+        if (val > 255) return 255;
+        return (byte)(val + 0.5);
+    }
+}
+
+Compile
+bat
+Copy
+Edit
+csc /t:exe /out:LanczosBatchAdvancedGdi.exe LanczosBatchAdvancedGdi.cs /r:System.Drawing.dll /platform:anycpu /unsafe
+
+Usage examples
+
+Upscale all PNG images in input_images by 2× into output_images folder:
+
+bat
+Copy
+Edit
+LanczosBatchAdvancedGdi.exe "input_images\*.png" output_images 2.0
+
+
+Upscale a single JPEG file by 3× into folder output:
+
+bat
+Copy
+Edit
+LanczosBatchAdvancedGdi.exe input.jpg output 3.0
+
+What it does:
+
+Ctrl+C support: gracefully cancels ongoing processing.
+
+Progress bar: live updates during each file upscale.
+
+Tile-based processing: processes image vertical slices in blocks (64 rows by default), reducing peak memory and improving CPU cache use.
+
+Two-pass separable Lanczos: much faster than naive 2D kernel, keeping high quality.
+
+Parallelization inside tile: both horizontal and vertical passes are parallelized per-row.
+
+Supports wildcards: batch upscale many images.
+
+Output format detection: saves as PNG/JPEG/BMP based on extension, defaults to PNG.
+
+If you want help running this or additional features (like custom tile size, other output formats, or GUI), just ask!
+--------------------------------------

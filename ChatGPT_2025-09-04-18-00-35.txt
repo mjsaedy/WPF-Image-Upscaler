@@ -1,0 +1,1085 @@
+--------------------------------------
+User:
+
+
+Here is a program to upscale images using WPF. It targets the NET Framework 4.7+ and compiles using csc.exe
+Evaluate the code, then we have some modifications to make:
+
+using System;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+class Program
+{
+    [STAThread] // Required for WPF imaging
+    static void Main(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("Usage: WpfConsoleUpscaler.exe <inputPattern> <outputFolder> <scale>");
+            Console.WriteLine("Example: WpfConsoleUpscaler.exe \"images\\*.png\" upscaled 2.0");
+            return;
+        }
+
+        string inputPattern = args[0];
+        string outputFolder = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0)
+        {
+            Console.WriteLine("Invalid scale value.");
+            return;
+        }
+
+        string dir = Path.GetDirectoryName(inputPattern);
+        if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+        string pattern = Path.GetFileName(inputPattern);
+
+        if (!Directory.Exists(dir))
+        {
+            Console.WriteLine("Input folder not found.");
+            return;
+        }
+        Directory.CreateDirectory(outputFolder);
+
+        var files = Directory.GetFiles(dir, pattern);
+        if (files.Length == 0)
+        {
+            Console.WriteLine("No matching files found.");
+            return;
+        }
+
+        Console.WriteLine($"Found {files.Length} file(s). Output folder: {Path.GetFullPath(outputFolder)}");
+
+        foreach (var file in files)
+        {
+            try
+            {
+                string outName = Path.Combine(outputFolder, Path.GetFileName(file));
+                UpscaleFile(file, outName, scale);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing {file}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine("All done.");
+    }
+
+    static void UpscaleFile(string inputPath, string outputPath, double scale)
+    {
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.CacheOption = BitmapCacheOption.OnLoad;
+        bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+        bi.EndInit();
+        bi.Freeze();
+
+        int targetW = (int)Math.Round(bi.PixelWidth * scale);
+        int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+        Console.WriteLine($"Upscaling {Path.GetFileName(inputPath)}: {bi.PixelWidth}x{bi.PixelHeight} ? {targetW}x{targetH}");
+
+        var result = RenderScaleWithWpf(bi, targetW, targetH);
+
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        BitmapEncoder encoder;
+        if (ext == ".jpg" || ext == ".jpeg")
+            encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+        else if (ext == ".bmp")
+            encoder = new BmpBitmapEncoder();
+        else
+        {
+            ext = ".png";
+            outputPath = Path.ChangeExtension(outputPath, ".png");
+            encoder = new PngBitmapEncoder();
+        }
+
+        encoder.Frames.Add(BitmapFrame.Create(result));
+        using (var fs = new FileStream(outputPath, FileMode.Create))
+            encoder.Save(fs);
+    }
+
+    static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH)
+    {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen())
+        {
+            var brush = new ImageBrush(src) { Stretch = Stretch.Fill };
+            dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+        }
+        RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.Fant);
+
+        var rtb = new RenderTargetBitmap(targetW, targetH, 96, 96, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+}
+--------------------------------------
+ChatGPT:
+
+
+I’ve carefully reviewed your WPF upscaler code targeting .NET Framework 4.7+. Here’s an evaluation and some observations before you decide on modifications:
+
+1. Functionality Overview
+
+The program takes a file pattern, an output folder, and a scaling factor.
+
+It enumerates matching files in the input folder.
+
+Each image is loaded into a BitmapImage.
+
+A WPF DrawingVisual with an ImageBrush is used to scale the image.
+
+The output is saved in PNG, JPEG, or BMP format based on the extension.
+
+2. Correctness
+
+✅ Positive aspects:
+
+Correct use of [STAThread] for WPF operations.
+
+BitmapImage is properly Freeze()d for thread safety.
+
+RenderTargetBitmap is correctly created and returned.
+
+The encoder selection covers common image types.
+
+The code handles invalid input and missing folders gracefully.
+
+⚠️ Potential issues / improvements:
+
+BitmapScalingMode:
+
+csharp
+Copy code
+RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.Fant);
+
+
+BitmapScalingMode.Fant is correct for high-quality downscaling, but for upscaling, HighQuality or Linear may be better.
+
+It might not have a noticeable effect for very large scale factors.
+
+Stretch.Fill vs. Uniform / UniformToFill:
+
+Using Stretch.Fill can distort images if width and height scales differ.
+
+If you want to preserve the aspect ratio, consider Stretch.Uniform.
+
+Resolution in RenderTargetBitmap:
+
+csharp
+Copy code
+var rtb = new RenderTargetBitmap(targetW, targetH, 96, 96, PixelFormats.Pbgra32);
+
+
+Currently, the DPI is fixed at 96. If the original image has higher DPI, this may reduce quality.
+
+Could use bi.DpiX and bi.DpiY for a more faithful scaling.
+
+File pattern handling:
+
+csharp
+Copy code
+string dir = Path.GetDirectoryName(inputPattern);
+if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+string pattern = Path.GetFileName(inputPattern);
+
+
+Works for simple patterns like "images\*.png", but does not handle recursive search or full wildcard paths.
+
+Error handling:
+
+Currently, exceptions are printed but processing continues. This is reasonable for batch processing.
+
+Performance:
+
+Rendering with RenderTargetBitmap is single-threaded.
+
+For large batches, you could parallelize UpscaleFile calls using Parallel.ForEach.
+
+3. Code Style / Minor Notes
+
+The using directive inside UpscaleFile is good.
+
+Could combine encoder selection into a switch for clarity.
+
+Logging could be enhanced (e.g., include input/output paths consistently).
+
+4. Overall Assessment
+
+Quality: High-quality upscaling using WPF.
+
+Robustness: Handles bad input, missing folders, no matches.
+
+Limitations: Aspect ratio can be distorted; single-threaded; fixed DPI.
+
+If you want, we can modify it to include:
+
+Aspect-ratio-preserving scaling (optional).
+
+Adjustable sharpening.
+
+Saturation adjustment.
+
+Mirroring / flipping images.
+
+Optional parallel processing for speed.
+
+This would make it a fully-featured WPF upscaler.
+
+Do you want me to implement all these enhancements next?
+--------------------------------------
+User:
+
+
+Apply the following:
+BitmapScalingMode.HighQuality
+Stretch.Uniform
+use bi.DpiX and bi.DpiY for a more faithful scaling
+
+Change the command line to handle only one image by specifying the input and output files. Make sure not to overwrite an existing file unless a switch is provided /over
+
+Add functionality to change saturation and apply sharpness using switches, for example:
+/sat:25 /sharp:2
+
+make sure all operations produce the highest quality possible.
+--------------------------------------
+ChatGPT:
+
+
+Got it ✅ — I’ll refactor your WPF upscaler to:
+
+Use BitmapScalingMode.HighQuality instead of Fant.
+
+Use Stretch.Uniform so images are never distorted.
+
+Respect the original DPI (bi.DpiX / bi.DpiY).
+
+Change command line:
+
+bash
+Copy code
+WpfConsoleUpscaler.exe <inputFile> <outputFile> <scale> [/over] [/sat:VALUE] [/sharp:VALUE]
+
+
+Processes only one file at a time.
+
+Prevents overwrite unless /over is supplied.
+
+Add optional saturation adjustment (/sat:N, where 0 = grayscale, 100 = normal, >100 = more saturation).
+
+Add optional sharpening (/sharp:N, where N is an intensity factor).
+
+Keep processing at highest quality possible using WPF effects and pixel shaders.
+
+Here’s the updated program:
+
+csharp
+Copy code
+using System;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+class Program {
+    [STAThread]
+    static void Main(string[] args) {
+        if (args.Length < 3) {
+            Console.WriteLine("Usage: WpfConsoleUpscaler.exe <inputFile> <outputFile> <scale> [/over] [/sat:VALUE] [/sharp:VALUE]");
+            Console.WriteLine("Example: WpfConsoleUpscaler.exe in.png out.png 2.0 /over /sat:120 /sharp:2");
+            return;
+        }
+
+        string inputFile = args[0];
+        string outputFile = args[1];
+        if (!double.TryParse(args[2], out double scale) || scale <= 0) {
+            Console.WriteLine("Invalid scale value.");
+            return;
+        }
+
+        bool overwrite = args.Any(a => a.Equals("/over", StringComparison.OrdinalIgnoreCase));
+        int saturation = 100; // default normal
+        double sharpness = 0; // default none
+
+        foreach (var arg in args.Skip(3)) {
+            if (arg.StartsWith("/sat:", StringComparison.OrdinalIgnoreCase)) {
+                if (int.TryParse(arg.Substring(5), out int satVal)) saturation = satVal;
+            }
+            else if (arg.StartsWith("/sharp:", StringComparison.OrdinalIgnoreCase)) {
+                if (double.TryParse(arg.Substring(7), out double shVal)) sharpness = shVal;
+            }
+        }
+
+        if (!File.Exists(inputFile)) {
+            Console.WriteLine("Input file not found.");
+            return;
+        }
+        if (File.Exists(outputFile) && !overwrite) {
+            Console.WriteLine($"Output file '{outputFile}' already exists. Use /over to overwrite.");
+            return;
+        }
+
+        try {
+            UpscaleFile(inputFile, outputFile, scale, saturation, sharpness);
+            Console.WriteLine("Done.");
+        }
+        catch (Exception ex) {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static void UpscaleFile(string inputPath, string outputPath, double scale, int saturation, double sharpness) {
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.CacheOption = BitmapCacheOption.OnLoad;
+        bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+        bi.EndInit();
+        bi.Freeze();
+
+        int targetW = (int)Math.Round(bi.PixelWidth * scale);
+        int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+        Console.WriteLine($"Upscaling {Path.GetFileName(inputPath)}: {bi.PixelWidth}x{bi.PixelHeight} -> {targetW}x{targetH}");
+
+        BitmapSource result = RenderScaleWithWpf(bi, targetW, targetH, bi.DpiX, bi.DpiY);
+
+        if (saturation != 100)
+            result = AdjustSaturation(result, saturation);
+
+        if (sharpness > 0)
+            result = ApplySharpen(result, sharpness);
+
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        BitmapEncoder encoder;
+        if (ext == ".jpg" || ext == ".jpeg")
+            encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+        else if (ext == ".bmp")
+            encoder = new BmpBitmapEncoder();
+        else {
+            ext = ".png";
+            outputPath = Path.ChangeExtension(outputPath, ".png");
+            encoder = new PngBitmapEncoder();
+        }
+
+        encoder.Frames.Add(BitmapFrame.Create(result));
+        using (var fs = new FileStream(outputPath, FileMode.Create))
+            encoder.Save(fs);
+    }
+
+    static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH, double dpiX, double dpiY) {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen()) {
+            var brush = new ImageBrush(src) { Stretch = Stretch.Uniform };
+            dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+        }
+        RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.HighQuality);
+
+        var rtb = new RenderTargetBitmap(targetW, targetH, dpiX, dpiY, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+
+    static BitmapSource AdjustSaturation(BitmapSource src, int saturation) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        src.CopyPixels(pixels, stride, 0);
+
+        double satFactor = saturation / 100.0;
+        for (int i = 0; i < pixels.Length; i += 4) {
+            double b = pixels[i] / 255.0;
+            double g = pixels[i + 1] / 255.0;
+            double r = pixels[i + 2] / 255.0;
+
+            double gray = 0.3 * r + 0.59 * g + 0.11 * b;
+            r = gray + (r - gray) * satFactor;
+            g = gray + (g - gray) * satFactor;
+            b = gray + (b - gray) * satFactor;
+
+            pixels[i] = (byte)Math.Min(255, Math.Max(0, b * 255));
+            pixels[i + 1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+            pixels[i + 2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+        }
+
+        var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+
+    static BitmapSource ApplySharpen(BitmapSource src, double strength) {
+        // Simple sharpening kernel (unsharp mask style)
+        int size = 3;
+        double[,] kernel = {
+            { 0, -1, 0 },
+            { -1, 5, -1 },
+            { 0, -1, 0 }
+        };
+
+        // Scale kernel strength
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+                kernel[y, x] *= strength;
+
+        return Convolve(src, kernel);
+    }
+
+    static BitmapSource Convolve(BitmapSource src, double[,] kernel) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        byte[] output = new byte[pixels.Length];
+        src.CopyPixels(pixels, stride, 0);
+
+        int w = src.PixelWidth;
+        int h = src.PixelHeight;
+        int kSize = kernel.GetLength(0);
+        int kHalf = kSize / 2;
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                double r = 0, g = 0, b = 0;
+                for (int ky = -kHalf; ky <= kHalf; ky++) {
+                    for (int kx = -kHalf; kx <= kHalf; kx++) {
+                        int px = Math.Min(w - 1, Math.Max(0, x + kx));
+                        int py = Math.Min(h - 1, Math.Max(0, y + ky));
+                        int idx = (py * stride) + px * 4;
+
+                        double kval = kernel[ky + kHalf, kx + kHalf];
+                        b += pixels[idx] * kval;
+                        g += pixels[idx + 1] * kval;
+                        r += pixels[idx + 2] * kval;
+                    }
+                }
+
+                int outIdx = (y * stride) + x * 4;
+                output[outIdx] = (byte)Math.Min(255, Math.Max(0, b));
+                output[outIdx + 1] = (byte)Math.Min(255, Math.Max(0, g));
+                output[outIdx + 2] = (byte)Math.Min(255, Math.Max(0, r));
+                output[outIdx + 3] = pixels[outIdx + 3]; // alpha unchanged
+            }
+        }
+
+        var wb = new WriteableBitmap(w, h, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, w, h), output, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+}
+
+
+✨ Summary of changes:
+
+Command line now handles one input/output file.
+
+No overwrite unless /over is specified.
+
+Saturation control (/sat:VALUE).
+
+Sharpening filter (/sharp:VALUE).
+
+High-quality scaling with original DPI preserved.
+
+Stretch.Uniform for aspect-ratio safe scaling.
+
+Do you want me to also add a mirror/flip switch (like /mirror:h or /mirror:v) while we’re extending operations?
+--------------------------------------
+User:
+
+
+add /mirror but make the default horizontal
+also make scale a switch /scale with a default value of 2
+--------------------------------------
+ChatGPT:
+
+
+Perfect 👍 — I’ll update the program so that:
+
+/scale:N switch sets scale (default = 2.0).
+
+/mirror switch is supported (defaults to horizontal flip if present, optional /mirror:v for vertical).
+
+Command line signature is now:
+
+bash
+Copy code
+WpfConsoleUpscaler.exe <inputFile> <outputFile> [/over] [/scale:N] [/sat:N] [/sharp:N] [/mirror[:h|v]]
+
+
+Here’s the revised code:
+
+csharp
+Copy code
+using System;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+class Program {
+    [STAThread]
+    static void Main(string[] args) {
+        if (args.Length < 2) {
+            Console.WriteLine("Usage: WpfConsoleUpscaler.exe <inputFile> <outputFile> [/over] [/scale:N] [/sat:N] [/sharp:N] [/mirror[:h|v]]");
+            Console.WriteLine("Defaults: /scale:2, no saturation/sharpen/mirror applied unless specified.");
+            return;
+        }
+
+        string inputFile = args[0];
+        string outputFile = args[1];
+
+        bool overwrite = false;
+        double scale = 2.0; // default
+        int saturation = 100; // default normal
+        double sharpness = 0; // default none
+        string mirror = null; // "h" or "v"
+
+        foreach (var arg in args.Skip(2)) {
+            if (arg.Equals("/over", StringComparison.OrdinalIgnoreCase)) {
+                overwrite = true;
+            }
+            else if (arg.StartsWith("/scale:", StringComparison.OrdinalIgnoreCase)) {
+                if (double.TryParse(arg.Substring(7), out double sc) && sc > 0) scale = sc;
+            }
+            else if (arg.StartsWith("/sat:", StringComparison.OrdinalIgnoreCase)) {
+                if (int.TryParse(arg.Substring(5), out int satVal)) saturation = satVal;
+            }
+            else if (arg.StartsWith("/sharp:", StringComparison.OrdinalIgnoreCase)) {
+                if (double.TryParse(arg.Substring(7), out double shVal)) sharpness = shVal;
+            }
+            else if (arg.StartsWith("/mirror", StringComparison.OrdinalIgnoreCase)) {
+                // /mirror or /mirror:h → horizontal (default)
+                // /mirror:v → vertical
+                if (arg.Contains(":")) {
+                    var val = arg.Split(':')[1].ToLower();
+                    if (val == "v") mirror = "v";
+                    else mirror = "h";
+                }
+                else {
+                    mirror = "h"; // default
+                }
+            }
+        }
+
+        if (!File.Exists(inputFile)) {
+            Console.WriteLine("Input file not found.");
+            return;
+        }
+        if (File.Exists(outputFile) && !overwrite) {
+            Console.WriteLine($"Output file '{outputFile}' already exists. Use /over to overwrite.");
+            return;
+        }
+
+        try {
+            UpscaleFile(inputFile, outputFile, scale, saturation, sharpness, mirror);
+            Console.WriteLine("Done.");
+        }
+        catch (Exception ex) {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static void UpscaleFile(string inputPath, string outputPath, double scale, int saturation, double sharpness, string mirror) {
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.CacheOption = BitmapCacheOption.OnLoad;
+        bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+        bi.EndInit();
+        bi.Freeze();
+
+        int targetW = (int)Math.Round(bi.PixelWidth * scale);
+        int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+        Console.WriteLine($"Upscaling {Path.GetFileName(inputPath)}: {bi.PixelWidth}x{bi.PixelHeight} -> {targetW}x{targetH}");
+
+        BitmapSource result = RenderScaleWithWpf(bi, targetW, targetH, bi.DpiX, bi.DpiY);
+
+        if (mirror != null)
+            result = ApplyMirror(result, mirror);
+
+        if (saturation != 100)
+            result = AdjustSaturation(result, saturation);
+
+        if (sharpness > 0)
+            result = ApplySharpen(result, sharpness);
+
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        BitmapEncoder encoder;
+        if (ext == ".jpg" || ext == ".jpeg")
+            encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+        else if (ext == ".bmp")
+            encoder = new BmpBitmapEncoder();
+        else {
+            ext = ".png";
+            outputPath = Path.ChangeExtension(outputPath, ".png");
+            encoder = new PngBitmapEncoder();
+        }
+
+        encoder.Frames.Add(BitmapFrame.Create(result));
+        using (var fs = new FileStream(outputPath, FileMode.Create))
+            encoder.Save(fs);
+    }
+
+    static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH, double dpiX, double dpiY) {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen()) {
+            var brush = new ImageBrush(src) { Stretch = Stretch.Uniform };
+            dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+        }
+        RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.HighQuality);
+
+        var rtb = new RenderTargetBitmap(targetW, targetH, dpiX, dpiY, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+
+    static BitmapSource ApplyMirror(BitmapSource src, string mode) {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen()) {
+            var scaleX = (mode == "h") ? -1 : 1;
+            var scaleY = (mode == "v") ? -1 : 1;
+            var transform = new ScaleTransform(scaleX, scaleY, src.PixelWidth / 2.0, src.PixelHeight / 2.0);
+            dc.PushTransform(transform);
+            dc.DrawImage(src, new Rect(0, 0, src.PixelWidth, src.PixelHeight));
+            dc.Pop();
+        }
+        var rtb = new RenderTargetBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+
+    static BitmapSource AdjustSaturation(BitmapSource src, int saturation) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        src.CopyPixels(pixels, stride, 0);
+
+        double satFactor = saturation / 100.0;
+        for (int i = 0; i < pixels.Length; i += 4) {
+            double b = pixels[i] / 255.0;
+            double g = pixels[i + 1] / 255.0;
+            double r = pixels[i + 2] / 255.0;
+
+            double gray = 0.3 * r + 0.59 * g + 0.11 * b;
+            r = gray + (r - gray) * satFactor;
+            g = gray + (g - gray) * satFactor;
+            b = gray + (b - gray) * satFactor;
+
+            pixels[i] = (byte)Math.Min(255, Math.Max(0, b * 255));
+            pixels[i + 1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+            pixels[i + 2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+        }
+
+        var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+
+    static BitmapSource ApplySharpen(BitmapSource src, double strength) {
+        int size = 3;
+        double[,] kernel = {
+            { 0, -1, 0 },
+            { -1, 5, -1 },
+            { 0, -1, 0 }
+        };
+
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+                kernel[y, x] *= strength;
+
+        return Convolve(src, kernel);
+    }
+
+    static BitmapSource Convolve(BitmapSource src, double[,] kernel) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        byte[] output = new byte[pixels.Length];
+        src.CopyPixels(pixels, stride, 0);
+
+        int w = src.PixelWidth;
+        int h = src.PixelHeight;
+        int kSize = kernel.GetLength(0);
+        int kHalf = kSize / 2;
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                double r = 0, g = 0, b = 0;
+                for (int ky = -kHalf; ky <= kHalf; ky++) {
+                    for (int kx = -kHalf; kx <= kHalf; kx++) {
+                        int px = Math.Min(w - 1, Math.Max(0, x + kx));
+                        int py = Math.Min(h - 1, Math.Max(0, y + ky));
+                        int idx = (py * stride) + px * 4;
+
+                        double kval = kernel[ky + kHalf, kx + kHalf];
+                        b += pixels[idx] * kval;
+                        g += pixels[idx + 1] * kval;
+                        r += pixels[idx + 2] * kval;
+                    }
+                }
+
+                int outIdx = (y * stride) + x * 4;
+                output[outIdx] = (byte)Math.Min(255, Math.Max(0, b));
+                output[outIdx + 1] = (byte)Math.Min(255, Math.Max(0, g));
+                output[outIdx + 2] = (byte)Math.Min(255, Math.Max(0, r));
+                output[outIdx + 3] = pixels[outIdx + 3];
+            }
+        }
+
+        var wb = new WriteableBitmap(w, h, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, w, h), output, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+}
+
+✅ Example usage
+
+Default upscale ×2, overwrite allowed:
+
+pgsql
+Copy code
+WpfConsoleUpscaler.exe in.png out.png /over
+
+
+Upscale ×3, boost saturation, sharpen, and mirror horizontally:
+
+bash
+Copy code
+WpfConsoleUpscaler.exe in.png out.png /scale:3 /sat:140 /sharp:2 /mirror
+
+
+Vertical mirror with upscale ×1.5:
+
+bash
+Copy code
+WpfConsoleUpscaler.exe in.png out.png /scale:1.5 /mirror:v
+
+
+Want me to also add /gray as a shorthand for /sat:0? That would make quick grayscale conversion easy.
+--------------------------------------
+User:
+
+
+add /quality or /q for setting jpeg quality.
+And provide help that specifie sthe ranges of acceptable values
+--------------------------------------
+ChatGPT:
+
+
+Great idea 👍 — I’ll add /quality:N or /q:N for JPEG output quality.
+
+Default: 95 (high quality).
+
+Range: 1–100 (where 100 = best quality, largest file size).
+
+Other switches (/scale, /sat, /sharp) will also get their valid ranges explained in the help text.
+
+Here’s the updated program:
+
+csharp
+Copy code
+using System;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+class Program {
+    [STAThread]
+    static void Main(string[] args) {
+        if (args.Length < 2 || args.Any(a => a.Equals("/?", StringComparison.OrdinalIgnoreCase) || a.Equals("/help", StringComparison.OrdinalIgnoreCase))) {
+            ShowHelp();
+            return;
+        }
+
+        string inputFile = args[0];
+        string outputFile = args[1];
+
+        bool overwrite = false;
+        double scale = 2.0; // default
+        int saturation = 100; // default normal
+        double sharpness = 0; // default none
+        string mirror = null; // "h" or "v"
+        int jpegQuality = 95; // default quality
+
+        foreach (var arg in args.Skip(2)) {
+            if (arg.Equals("/over", StringComparison.OrdinalIgnoreCase)) {
+                overwrite = true;
+            }
+            else if (arg.StartsWith("/scale:", StringComparison.OrdinalIgnoreCase)) {
+                if (double.TryParse(arg.Substring(7), out double sc) && sc > 0) scale = sc;
+            }
+            else if (arg.StartsWith("/sat:", StringComparison.OrdinalIgnoreCase)) {
+                if (int.TryParse(arg.Substring(5), out int satVal)) saturation = satVal;
+            }
+            else if (arg.StartsWith("/sharp:", StringComparison.OrdinalIgnoreCase)) {
+                if (double.TryParse(arg.Substring(7), out double shVal)) sharpness = shVal;
+            }
+            else if (arg.StartsWith("/mirror", StringComparison.OrdinalIgnoreCase)) {
+                if (arg.Contains(":")) {
+                    var val = arg.Split(':')[1].ToLower();
+                    if (val == "v") mirror = "v";
+                    else mirror = "h";
+                }
+                else {
+                    mirror = "h"; // default
+                }
+            }
+            else if (arg.StartsWith("/quality:", StringComparison.OrdinalIgnoreCase) || arg.StartsWith("/q:", StringComparison.OrdinalIgnoreCase)) {
+                var val = arg.Contains(":") ? arg.Split(':')[1] : null;
+                if (int.TryParse(val, out int qVal) && qVal >= 1 && qVal <= 100) jpegQuality = qVal;
+            }
+        }
+
+        if (!File.Exists(inputFile)) {
+            Console.WriteLine("Input file not found.");
+            return;
+        }
+        if (File.Exists(outputFile) && !overwrite) {
+            Console.WriteLine($"Output file '{outputFile}' already exists. Use /over to overwrite.");
+            return;
+        }
+
+        try {
+            UpscaleFile(inputFile, outputFile, scale, saturation, sharpness, mirror, jpegQuality);
+            Console.WriteLine("Done.");
+        }
+        catch (Exception ex) {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static void ShowHelp() {
+        Console.WriteLine("WpfConsoleUpscaler.exe <inputFile> <outputFile> [options]");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  /over                Allow overwriting existing files");
+        Console.WriteLine("  /scale:N             Scaling factor (default = 2.0). Must be > 0");
+        Console.WriteLine("  /sat:N               Saturation adjustment (0 = grayscale, 100 = normal, >100 = oversaturated)");
+        Console.WriteLine("  /sharp:N             Sharpening strength (0 = off, suggested range 1–3)");
+        Console.WriteLine("  /mirror[:h|v]        Mirror the image (default = horizontal if no h/v given)");
+        Console.WriteLine("  /quality:N or /q:N   JPEG quality (1–100, default = 95)");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  WpfConsoleUpscaler.exe in.png out.png /scale:3 /sat:120 /sharp:2 /mirror /over");
+        Console.WriteLine("  WpfConsoleUpscaler.exe in.jpg out.jpg /q:85 /sat:0   (grayscale, JPEG quality 85)");
+    }
+
+    static void UpscaleFile(string inputPath, string outputPath, double scale, int saturation, double sharpness, string mirror, int jpegQuality) {
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.CacheOption = BitmapCacheOption.OnLoad;
+        bi.UriSource = new Uri(Path.GetFullPath(inputPath));
+        bi.EndInit();
+        bi.Freeze();
+
+        int targetW = (int)Math.Round(bi.PixelWidth * scale);
+        int targetH = (int)Math.Round(bi.PixelHeight * scale);
+
+        Console.WriteLine($"Upscaling {Path.GetFileName(inputPath)}: {bi.PixelWidth}x{bi.PixelHeight} -> {targetW}x{targetH}");
+
+        BitmapSource result = RenderScaleWithWpf(bi, targetW, targetH, bi.DpiX, bi.DpiY);
+
+        if (mirror != null)
+            result = ApplyMirror(result, mirror);
+
+        if (saturation != 100)
+            result = AdjustSaturation(result, saturation);
+
+        if (sharpness > 0)
+            result = ApplySharpen(result, sharpness);
+
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        BitmapEncoder encoder;
+        if (ext == ".jpg" || ext == ".jpeg")
+            encoder = new JpegBitmapEncoder { QualityLevel = jpegQuality };
+        else if (ext == ".bmp")
+            encoder = new BmpBitmapEncoder();
+        else {
+            ext = ".png";
+            outputPath = Path.ChangeExtension(outputPath, ".png");
+            encoder = new PngBitmapEncoder();
+        }
+
+        encoder.Frames.Add(BitmapFrame.Create(result));
+        using (var fs = new FileStream(outputPath, FileMode.Create))
+            encoder.Save(fs);
+    }
+
+    static BitmapSource RenderScaleWithWpf(BitmapSource src, int targetW, int targetH, double dpiX, double dpiY) {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen()) {
+            var brush = new ImageBrush(src) { Stretch = Stretch.Uniform };
+            dc.DrawRectangle(brush, null, new Rect(0, 0, targetW, targetH));
+        }
+        RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.HighQuality);
+
+        var rtb = new RenderTargetBitmap(targetW, targetH, dpiX, dpiY, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+
+    static BitmapSource ApplyMirror(BitmapSource src, string mode) {
+        var dv = new DrawingVisual();
+        using (var dc = dv.RenderOpen()) {
+            var scaleX = (mode == "h") ? -1 : 1;
+            var scaleY = (mode == "v") ? -1 : 1;
+            var transform = new ScaleTransform(scaleX, scaleY, src.PixelWidth / 2.0, src.PixelHeight / 2.0);
+            dc.PushTransform(transform);
+            dc.DrawImage(src, new Rect(0, 0, src.PixelWidth, src.PixelHeight));
+            dc.Pop();
+        }
+        var rtb = new RenderTargetBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, PixelFormats.Pbgra32);
+        rtb.Render(dv);
+        rtb.Freeze();
+        return rtb;
+    }
+
+    static BitmapSource AdjustSaturation(BitmapSource src, int saturation) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        src.CopyPixels(pixels, stride, 0);
+
+        double satFactor = saturation / 100.0;
+        for (int i = 0; i < pixels.Length; i += 4) {
+            double b = pixels[i] / 255.0;
+            double g = pixels[i + 1] / 255.0;
+            double r = pixels[i + 2] / 255.0;
+
+            double gray = 0.3 * r + 0.59 * g + 0.11 * b;
+            r = gray + (r - gray) * satFactor;
+            g = gray + (g - gray) * satFactor;
+            b = gray + (b - gray) * satFactor;
+
+            pixels[i] = (byte)Math.Min(255, Math.Max(0, b * 255));
+            pixels[i + 1] = (byte)Math.Min(255, Math.Max(0, g * 255));
+            pixels[i + 2] = (byte)Math.Min(255, Math.Max(0, r * 255));
+        }
+
+        var wb = new WriteableBitmap(src.PixelWidth, src.PixelHeight, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, src.PixelWidth, src.PixelHeight), pixels, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+
+    static BitmapSource ApplySharpen(BitmapSource src, double strength) {
+        int size = 3;
+        double[,] kernel = {
+            { 0, -1, 0 },
+            { -1, 5, -1 },
+            { 0, -1, 0 }
+        };
+
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+                kernel[y, x] *= strength;
+
+        return Convolve(src, kernel);
+    }
+
+    static BitmapSource Convolve(BitmapSource src, double[,] kernel) {
+        var format = PixelFormats.Pbgra32;
+        int stride = src.PixelWidth * (format.BitsPerPixel / 8);
+        byte[] pixels = new byte[stride * src.PixelHeight];
+        byte[] output = new byte[pixels.Length];
+        src.CopyPixels(pixels, stride, 0);
+
+        int w = src.PixelWidth;
+        int h = src.PixelHeight;
+        int kSize = kernel.GetLength(0);
+        int kHalf = kSize / 2;
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                double r = 0, g = 0, b = 0;
+                for (int ky = -kHalf; ky <= kHalf; ky++) {
+                    for (int kx = -kHalf; kx <= kHalf; kx++) {
+                        int px = Math.Min(w - 1, Math.Max(0, x + kx));
+                        int py = Math.Min(h - 1, Math.Max(0, y + ky));
+                        int idx = (py * stride) + px * 4;
+
+                        double kval = kernel[ky + kHalf, kx + kHalf];
+                        b += pixels[idx] * kval;
+                        g += pixels[idx + 1] * kval;
+                        r += pixels[idx + 2] * kval;
+                    }
+                }
+
+                int outIdx = (y * stride) + x * 4;
+                output[outIdx] = (byte)Math.Min(255, Math.Max(0, b));
+                output[outIdx + 1] = (byte)Math.Min(255, Math.Max(0, g));
+                output[outIdx + 2] = (byte)Math.Min(255, Math.Max(0, r));
+                output[outIdx + 3] = pixels[outIdx + 3];
+            }
+        }
+
+        var wb = new WriteableBitmap(w, h, src.DpiX, src.DpiY, format, null);
+        wb.WritePixels(new Int32Rect(0, 0, w, h), output, stride, 0);
+        wb.Freeze();
+        return wb;
+    }
+}
+
+✅ Help now specifies ranges:
+
+/scale:N → must be > 0 (e.g. 0.5, 2, 4).
+
+/sat:N → 0 = grayscale, 100 = normal, >100 = oversaturated.
+
+/sharp:N → 0 = off, suggested range 1–3.
+
+/mirror[:h|v] → horizontal (default) or vertical.
+
+/quality:N → JPEG quality 1–100, default = 95.
+
+Do you also want me to clamp invalid values (e.g. if user enters /sat:-50 or /quality:500) so it still runs with safe defaults, instead of silently ignoring?
+--------------------------------------
+User:
+
+
+I know that WinForms graphic functions use GDI+. But what does WPF use? It seems to give better results regarding quality
+--------------------------------------
+ChatGPT:
+
+
+Good observation 👌
+
+You’re right:
+
+WinForms / System.Drawing → built on GDI+ (the Windows Graphics Device Interface Plus). It’s an older raster graphics API from the Windows XP era. It’s fast and lightweight, but it was never designed for modern high-fidelity image scaling or color management. Interpolation in GDI+ (even with HighQualityBicubic) can be noticeably softer or introduce artifacts.
+
+WPF (Windows Presentation Foundation) → built on Direct3D (via the Windows Imaging Component, WIC).
+
+All images in WPF are handled as textures and rendered by the GPU (when hardware acceleration is available).
+
+Scaling in WPF (BitmapScalingMode.HighQuality) uses WIC’s high-quality resampling (e.g., Fant resampling, high-order filters), which tends to look sharper and more faithful than GDI+.
+
+WPF is also fully color-managed (it respects ICC profiles, sRGB, etc.), while GDI+ has very limited support.
+
+It natively works with 96+ DPI awareness and floating-point transforms, so scaling tends to be smoother.
+
+That’s why when you upscale with WPF, the results look more "photographic" and detailed compared to GDI+.
+
+👉 So in short:
+
+WinForms = GDI+ (CPU raster graphics).
+
+WPF = Direct3D + WIC (GPU accelerated, modern imaging pipeline).
+
+Would you like me to break down what exact interpolation algorithms WPF uses under HighQuality scaling? It’s not well documented, but I can dig into what WIC actually does behind the scenes.
+--------------------------------------
